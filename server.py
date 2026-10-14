@@ -10,6 +10,210 @@ import urllib.parse
 import urllib.request
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+import base64
+import hashlib
+import struct
+import socket
+
+# ========================================================
+# WebSocket Real-Time Relay (RFC 6455, stdlib-only)
+# --------------------------------------------------------
+# Endpoint: ws://host[:port]/ws  (also /bo1z/ws)
+# Protocol messages (JSON text frames):
+#   up:   {t:'join', room, pid, name, isHost}
+#         {t:'s', s:{...player state, zb:[zombie snapshot]}}
+#         {t:'ping', ts}
+#   down: {t:'hello', pid} | {t:'s', p, s} | {t:'gone', p, n} | {t:'pong', ts}
+# Every state message is relayed to the sender's roommates at once —
+# real-time push instead of HTTP polling.
+# ========================================================
+WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+WS_CLIENTS = {}          # room_id -> [client, ...]
+WS_LOCK = threading.Lock()
+WS_MAX_FRAME = 1 << 20   # 1 MiB guard
+
+
+class WsClient:
+    __slots__ = ('conn', 'room', 'pid', 'name', 'is_host', 'send_lock')
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.room = None
+        self.pid = None
+        self.name = ''
+        self.is_host = False
+        self.send_lock = threading.Lock()
+
+    def send_text(self, text):
+        try:
+            with self.send_lock:
+                ws_send_frame(self.conn, text.encode('utf-8'), opcode=1)
+            return True
+        except Exception:
+            return False
+
+
+def ws_recv_exact(conn, n):
+    buf = b''
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def ws_read_frame(conn):
+    """Return (opcode, payload bytes) or None on disconnect/protocol error."""
+    try:
+        hdr = ws_recv_exact(conn, 2)
+        if hdr is None:
+            return None
+        b1, b2 = hdr[0], hdr[1]
+        opcode = b1 & 0x0F
+        masked = b2 & 0x80
+        ln = b2 & 0x7F
+        if ln == 126:
+            ext = ws_recv_exact(conn, 2)
+            if ext is None:
+                return None
+            ln = struct.unpack('>H', ext)[0]
+        elif ln == 127:
+            ext = ws_recv_exact(conn, 8)
+            if ext is None:
+                return None
+            ln = struct.unpack('>Q', ext)[0]
+        if ln > WS_MAX_FRAME:
+            return None
+        mask = ws_recv_exact(conn, 4) if masked else None
+        payload = ws_recv_exact(conn, ln) if ln else b''
+        if payload is None:
+            return None
+        if mask:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        return opcode, payload
+    except Exception:
+        return None
+
+
+def ws_send_frame(conn, payload, opcode=1):
+    ln = len(payload)
+    hdr = bytearray()
+    hdr.append(0x80 | opcode)
+    if ln < 126:
+        hdr.append(ln)
+    elif ln < 65536:
+        hdr.append(126)
+        hdr += struct.pack('>H', ln)
+    else:
+        hdr.append(127)
+        hdr += struct.pack('>Q', ln)
+    conn.sendall(bytes(hdr) + payload)
+
+
+def ws_broadcast(room_id, data, exclude=None):
+    with WS_LOCK:
+        clients = list(WS_CLIENTS.get(room_id, []))
+    dead = []
+    for c in clients:
+        if exclude is not None and c is exclude:
+            continue
+        if not c.send_text(data):
+            dead.append(c)
+    if dead:
+        with WS_LOCK:
+            lst = WS_CLIENTS.get(room_id, [])
+            for c in dead:
+                if c in lst:
+                    lst.remove(c)
+
+
+def ws_client_thread(conn, addr):
+    """Per-connection relay loop (runs on the handler's request thread)."""
+    client = WsClient(conn)
+    try:
+        while True:
+            frame = ws_read_frame(conn)
+            if frame is None:
+                break
+            opcode, payload = frame
+            if opcode == 8:          # close
+                break
+            if opcode == 9:          # ping -> pong
+                ws_send_frame(conn, payload, opcode=10)
+                continue
+            if opcode == 10:         # pong
+                continue
+            if opcode != 1:          # only text frames carry JSON
+                continue
+            try:
+                msg = json.loads(payload.decode('utf-8'))
+            except Exception:
+                continue
+            mtype = msg.get('t')
+            if mtype == 'join':
+                room = str(msg.get('room') or '')[:32]
+                client.room = room
+                client.pid = str(msg.get('pid') or '')[:48]
+                client.name = str(msg.get('name') or 'Player')[:24]
+                client.is_host = bool(msg.get('isHost'))
+                with WS_LOCK:
+                    WS_CLIENTS.setdefault(room, []).append(client)
+                client.send_text(json.dumps({'t': 'hello', 'pid': client.pid}))
+            elif mtype == 'ping':
+                client.send_text(json.dumps({'t': 'pong', 'ts': msg.get('ts', 0)}))
+            elif mtype == 's' and client.room:
+                out = json.dumps({'t': 's', 'p': client.pid, 's': msg.get('s', {})},
+                                 separators=(',', ':'))
+                ws_broadcast(client.room, out, exclude=client)
+    except Exception:
+        pass
+    finally:
+        room, pid, name = client.room, client.pid, client.name
+        if room:
+            with WS_LOCK:
+                lst = WS_CLIENTS.get(room, [])
+                if client in lst:
+                    lst.remove(client)
+                if lst is not None and room in WS_CLIENTS and not WS_CLIENTS[room]:
+                    WS_CLIENTS.pop(room, None)
+            ws_broadcast(room, json.dumps({'t': 'gone', 'p': pid, 'n': name}))
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def ws_try_upgrade(handler):
+    """Handle a WebSocket upgrade request; returns True if hijacked."""
+    if (handler.headers.get('Upgrade', '').lower() != 'websocket'
+            or handler.command != 'GET'):
+        return False
+    parsed = urllib.parse.urlparse(handler.path)
+    path = parsed.path
+    if path.startswith('/bo1z/'):
+        path = path[len('/bo1z'):]
+    if path.rstrip('/') != '/ws':
+        return False
+
+    key = handler.headers.get('Sec-WebSocket-Key')
+    if not key:
+        return False
+    accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+    CRLF = chr(13) + chr(10)
+    response = (
+        'HTTP/1.1 101 Switching Protocols' + CRLF
+        + 'Upgrade: websocket' + CRLF
+        + 'Connection: Upgrade' + CRLF
+        + 'Sec-WebSocket-Accept: ' + accept + CRLF
+        + CRLF
+    )
+    try:
+        handler.connection.sendall(response.encode())
+    except Exception:
+        return False
+    ws_client_thread(handler.connection, handler.client_address)
+    return True
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REMOTE_BASE = 'https://vel.gg/bo1z/'
@@ -73,6 +277,7 @@ def serialize_room(r):
     }
 
 class GameServerHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'  # keep-alive: huge win for the polling fallback
     def send_cors_and_security_headers(self, content_type='text/html; charset=utf-8', content_length=None):
         self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
         self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
@@ -334,6 +539,10 @@ class GameServerHandler(BaseHTTPRequestHandler):
         self.handle_request(send_body=False)
 
     def do_GET(self):
+        # WebSocket relay endpoint (hijacks this request's thread for the connection lifetime)
+        if ws_try_upgrade(self):
+            self.close_connection = True
+            return
         self.handle_request(send_body=True)
 
     def handle_request(self, send_body=True):
@@ -517,11 +726,12 @@ class GameServerHandler(BaseHTTPRequestHandler):
                     self.wfile.write(data)
                 print(f"[AUTO-DOWNLOADED] {clean_path} -> Cached ({len(data)} bytes)")
         except Exception as e:
+            body = f"404 Not Found (Auto-download failed: {e})".encode('utf-8')
             self.send_response(404)
-            self.send_cors_and_security_headers(content_type='text/plain')
+            self.send_cors_and_security_headers(content_type='text/plain', content_length=len(body))
             self.end_headers()
             if send_body:
-                self.wfile.write(f"404 Not Found (Auto-download failed: {e})".encode('utf-8'))
+                self.wfile.write(body)
 
 def run_server(host='0.0.0.0', port=8080):
     server_address = (host, port)
@@ -530,6 +740,7 @@ def run_server(host='0.0.0.0', port=8080):
     print(f" BO1 Zombies Server (Multiplayer & Cloud-Ready)")
     print(f" Host: {host} | Port: {port}")
     print(f" URL: http://localhost:{port}/bo1z/")
+    print(f" WebSocket Relay: ws://<host>:{port}/ws (real-time co-op sync)")
     print(f" Auto-Download Engine: Active (Proxies missing assets)")
     print(f" Ready for Railway & Cloud deployment")
     print("=" * 65)

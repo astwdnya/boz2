@@ -2,6 +2,8 @@
 // BO1 Zombies - Ultimate Mod Menu (Devils Hack)
 // ========================================================
 
+import { CoopSoldier3D, projectToGameRect } from './coop3d.js';
+
 const WEAPONS_DB = [
   // --- Wonder Weapons ---
   { id: 'ray_gun_zm', name: 'Ray Gun', pap: 'Porter\'s X2 Ray Gun', cat: 'wonder', type: 'raygun', img: 'Ray Gun.png', desc: 'سلاح پرتو لیزری نمادین زامبی با شلیک ماده تاریک' },
@@ -212,6 +214,21 @@ class ModMenuManager {
     this.coopPlayers = [];
     this.coopSyncTimer = null;
     this.isTabScoreboardVisible = false;
+
+    // --- Co-op v3: true shared-state networking ---
+    this.coop3d = new CoopSoldier3D();      // WebGL 3D teammate renderer
+    this.coopWs = null;                     // WebSocket transport
+    this.wsRtt = 0;                         // measured round-trip ms
+    this.localKills = 0;                    // real zombie kill counter
+    this._prevAliveIds = null;              // alive entity id set (kill diffing)
+    this.killFeed = [];                     // recent co-op events
+    this._peerZb = new Map();               // peer zombie snapshots
+    this._peerZbMiss = new Map();           // peer zombie miss-streaks (kill confirm)
+    this._peerLastSeen = new Map();
+    this._spawnAligned = false; this._spawnDeadline = 0;
+    this._moving = false; this._myScore = 500;
+    this._coopStopped = false;
+    this._httpFallbackStarted = false; this._httpFallbackActive = false;
     this.setupGlobalHotkeys();
     this.init();
 
@@ -243,37 +260,39 @@ class ModMenuManager {
     }, 1000);
   }
 
-  teleport(x, y, z) {
+  teleport(x, y, z, yawDeg) {
     try {
       const rx = Math.round(x);
       const ry = Math.round(y);
       const rz = Math.round(z);
+      const yaw = (typeof yawDeg === 'number' && Number.isFinite(yawDeg)) ? Math.round(yawDeg) : 0;
       // setviewpos requires 4 arguments in Black Ops: x y z yaw
-      this.cmd(`setviewpos ${rx} ${ry} ${rz} 0`);
+      this.cmd(`setviewpos ${rx} ${ry} ${rz} ${yaw}`);
     } catch (e) {
       console.warn('[CO-OP] Teleport error:', e);
     }
   }
 
-  alignInitialSpawn(cam, p, isHost) {
+  alignInitialSpawn(p) {
     if (this._spawnAligned) return;
-    if (isHost) {
-      this._spawnAligned = true;
-      return;
-    }
-    if (p && typeof p.x === 'number' && Number.isFinite(p.x) && (p.x !== 0 || p.y !== 0)) {
-      if (cam && cam.valid) {
-        console.log(`[CO-OP] Teleporting to Host starting room: (${p.x + 60}, ${p.y}, ${p.z})`);
-        this.teleport(p.x + 60, p.y, p.z);
-        this._spawnAligned = true;
-      }
-    }
+    if (!p || typeof p.x !== 'number' || !Number.isFinite(p.x) || (p.x === 0 && p.y === 0)) return;
+    const cam = this.getMemoryContext()?.camera;
+    if (!cam || !cam.valid) return;
+    // Place the client side-by-side with the host using the HOST's right vector
+    // (right = fwd rotated -90deg around world Z-up) instead of a fixed +60 X offset.
+    const yaw = (typeof p.yaw === 'number') ? p.yaw : Math.atan2(p.fwdY ?? 0, p.fwdX ?? 1);
+    const rx = Math.sin(yaw), ry = -Math.cos(yaw);
+    const fl = Math.hypot(rx, ry) || 1;
+    const ox = (rx / fl) * 72, oy = (ry / fl) * 72;
+    const myYawDeg = Math.atan2(cam.fwd.y, cam.fwd.x) * 180 / Math.PI;
+    this.teleport(p.x + ox, p.y + oy, p.z, myYawDeg);
+    this._spawnAligned = true;
+    this.pushKillFeed(`⚡ Spawn aligned with ${p.name || 'Host'}`);
   }
 
   syncRemotePlayersToEngine(memCtx) {
-    // Teammate 3D visual rendering is handled completely safely by drawTacticalSoldier
-    // on the 3D perspective overlay to prevent mutating CGame snapshot memory and avoid
-    // any CG_TransitionSnapshot assertion crashes.
+    // v3: teammates render as TRUE 3D soldiers via coop3d.js (WebGL layer driven by
+    // the engine camera read from WASM memory). No CG snapshot mutation, no 2D body.
   }
 
   setupGlobalHotkeys() {
@@ -307,84 +326,254 @@ class ModMenuManager {
     if (!partyData || !partyData.room) return;
 
     this.partyData = partyData;
-    const roomId = partyData.room.id;
-    const playerId = partyData.playerId || 'p-player';
-    const isHost = Boolean(partyData.isHost);
-    const myName = (partyData.room.players || []).find(p => p.id === playerId)?.name || (isHost ? 'Host' : 'Player');
+    this.myPid = partyData.playerId || 'p-player';
+    this.myName = (partyData.room.players || []).find(p => p.id === this.myPid)?.name
+      || (partyData.isHost ? 'Host' : 'Player');
+    this.roomId = partyData.room.id;
+    this._spawnDeadline = performance.now() + 25000;
 
-    // Ensure ESP / 3D ally overlay loop is active
-    if (!this.espAnimFrame) {
-      this.startESPOverlay();
+    // Ensure the shared render loop (ESP canvas + 3D soldiers) is active
+    if (!this.espAnimFrame) this.startESPOverlay();
+
+    this.coopStartNetwork();
+  }
+
+  // ---- Build this player's compact state (camera from engine memory) ----
+  coopBuildState(includeZombies) {
+    const memCtx = this.getMemoryContext();
+    const cam = memCtx?.camera;
+    const valid = Boolean(cam && cam.valid);
+    const x = valid ? cam.x : (this._lastX ?? 0);
+    const y = valid ? cam.y : (this._lastY ?? 0);
+    const z = valid ? cam.z : (this._lastZ ?? 0);
+    if (valid) { this._lastX = x; this._lastY = y; this._lastZ = z; }
+    const yaw = valid ? Math.atan2(cam.fwd.y, cam.fwd.x) : 0;
+    const pitch = valid ? Math.asin(Math.max(-1, Math.min(1, cam.fwd.z))) : 0;
+
+    let score = 500;
+    if (memCtx?.cgPtr && memCtx?.heapU32) {
+      const sc = memCtx.heapU32[(memCtx.cgPtr + 372736) >> 2];
+      if (sc > 0 && sc < 1000000) score = sc;
     }
+    this._myScore = score;
 
-    if (this.coopSyncTimer) clearInterval(this.coopSyncTimer);
-    this.coopSyncTimer = setInterval(async () => {
+    const st = {
+      x: +x.toFixed(1), y: +y.toFixed(1), z: +z.toFixed(1),
+      yaw: +yaw.toFixed(3), pitch: +pitch.toFixed(3),
+      mv: Boolean(this._moving), cr: false, alive: true,
+      name: this.myName, isHost: Boolean(this.partyData?.isHost),
+      sc: score, k: this.localKills,
+    };
+    if (includeZombies && memCtx) {
+      const zl = this.getLiveZombies(memCtx);
+      st.zb = zl.slice(0, 40).map(zz => [zz.id, Math.round(zz.x), Math.round(zz.y), Math.round(zz.z)]);
+    }
+    return st;
+  }
+
+  // ---- Transport: WebSocket hub (server.py) with HTTP polling fallback ----
+  coopStartNetwork() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const pathBase = location.pathname.replace(/[^/]*$/, '');
+    const wsUrl = `${proto}://${location.host}${pathBase}ws`;
+
+    let ws = null, wsOk = false, reconnectDelay = 1000, tick = 0;
+
+    const connect = () => {
+      if (this._coopStopped) return;
+      try { ws = new WebSocket(wsUrl); } catch (e) { this.coopStartHttpFallback(); return; }
+      ws.onopen = () => {
+        wsOk = true; reconnectDelay = 1000;
+        try {
+          ws.send(JSON.stringify({ t: 'join', room: this.roomId, pid: this.myPid,
+            name: this.myName, isHost: Boolean(this.partyData?.isHost) }));
+          this.pushKillFeed('🌐 Live co-op sync connected');
+        } catch (e) {}
+      };
+      ws.onmessage = (ev) => {
+        let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+        if (msg.t === 's' && msg.s) {
+          msg.s.playerId = msg.p;
+          this.coopApplyPeer(msg.s);
+        } else if (msg.t === 'gone') {
+          this.coopPlayers = this.coopPlayers.filter(p => p.playerId !== msg.p);
+          this._peerZb.delete(msg.p);
+          this.pushKillFeed(`👋 ${msg.n || 'Player'} left the game`);
+        } else if (msg.t === 'pong') {
+          this.wsRtt = Math.max(1, Math.round(performance.now() - (msg.ts || 0)));
+        }
+      };
+      ws.onclose = () => {
+        wsOk = false;
+        this.coopStartHttpFallback();
+        setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(8000, reconnectDelay * 2);
+      };
+      ws.onerror = () => { try { ws.close(); } catch (e) {} };
+      this.coopWs = ws;
+    };
+    connect();
+
+    // App-level ping for the scoreboard RTT readout.
+    setInterval(() => {
+      if (wsOk && this.coopWs?.readyState === 1) {
+        try { this.coopWs.send(JSON.stringify({ t: 'ping', ts: performance.now() })); } catch (e) {}
+      }
+    }, 2000);
+
+    // 30 Hz state push; zombie snapshot piggybacks at ~7.5 Hz.
+    this.coopSyncTimer = setInterval(() => {
+      tick++;
       try {
         if (document.body?.dataset?.screen !== 'playing') return;
-        const memCtx = this.getMemoryContext();
-        if (!memCtx) return;
-        const cam = memCtx?.camera;
-        const myX = cam && cam.valid ? cam.x : 0;
-        const myY = cam && cam.valid ? cam.y : 0;
-        const myZ = cam && cam.valid ? cam.z : 0;
-        const fwdX = cam && cam.valid ? cam.fwd.x : 0;
-        const fwdY = cam && cam.valid ? cam.fwd.y : 0;
-        const fwdZ = cam && cam.valid ? cam.fwd.z : 0;
+        const st = this.coopBuildState(tick % 4 === 0);
+        // movement detection from sent-position deltas (30 Hz)
+        if (this._lastSentX !== undefined) {
+          const sp = Math.hypot(st.x - this._lastSentX, st.y - this._lastSentY, st.z - this._lastSentZ) / 0.033;
+          this._moving = sp > 25;
+        }
+        this._lastSentX = st.x; this._lastSentY = st.y; this._lastSentZ = st.z;
+        st.mv = Boolean(this._moving);
 
-        let currentScore = 500;
-        if (memCtx?.cgPtr && memCtx?.heapU32) {
-          const sc = memCtx.heapU32[(memCtx.cgPtr + 372736) >> 2];
-          if (sc > 0 && sc < 1000000) currentScore = sc;
+        if (wsOk && this.coopWs?.readyState === 1) {
+          this.coopWs.send(JSON.stringify({ t: 's', s: st }));
+        } else {
+          this._coopHttpPayload = st;
         }
 
-        let liveZombies = [];
-        try {
-          if (isHost) {
-            liveZombies = this.getLiveZombies(memCtx);
-          }
-        } catch (e) {}
+        // Spawn alignment retries during the first 25 s (host state may arrive late).
+        if (!this.partyData?.isHost && !this._spawnAligned && performance.now() < this._spawnDeadline) {
+          const host = this.coopPlayers.find(p => p.isHost);
+          if (host) this.alignInitialSpawn(host);
+        }
+      } catch (e) {}
+    }, 33);
 
-        const payload = {
-          roomId: roomId,
-          playerId: playerId,
-          state: {
-            name: myName,
-            isHost: isHost,
-            x: myX,
-            y: myY,
-            z: myZ,
-            fwdX: fwdX,
-            fwdY: fwdY,
-            fwdZ: fwdZ,
-            health: 100,
-            score: currentScore,
-            kills: 0,
-            headshots: 0,
-            zombies: isHost ? liveZombies.slice(0, 24).map(z => ({ id: z.id, x: Math.round(z.x), y: Math.round(z.y), z: Math.round(z.z), dist: z.distMeters })) : []
-          }
-        };
+    window.addEventListener('beforeunload', () => { this._coopStopped = true; try { this.coopWs?.close(); } catch (e) {} });
+  }
 
+  coopStartHttpFallback() {
+    if (this._httpFallbackStarted) return;
+    this._httpFallbackStarted = true;
+    this._httpFallbackActive = true;
+    const send = async () => {
+      if (this._coopStopped) return;
+      try {
+        if (this.coopWs?.readyState === 1) { this._httpFallbackActive = false; return; }
+        const st = this._coopHttpPayload || this.coopBuildState(false);
+        if (!st || !this.roomId) return;
         const resp = await fetch('/api/rooms/sync', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ roomId: this.roomId, playerId: this.myPid, state: st })
         });
         const res = await resp.json();
         if (res.success && Array.isArray(res.others)) {
-          this.coopPlayers = res.others;
-          const hostPlayer = this.coopPlayers.find(p => p.isHost);
-          if (hostPlayer && Array.isArray(hostPlayer.zombies) && hostPlayer.zombies.length > 0) {
-            this.hostSyncedZombies = hostPlayer.zombies;
-          }
-          if (memCtx) {
-            this.syncRemotePlayersToEngine(memCtx);
-            if (this.coopPlayers[0]) {
-              this.alignInitialSpawn(cam, this.coopPlayers[0], isHost);
+          for (const other of res.others) this.coopApplyPeer({ ...other, playerId: other.playerId });
+        }
+      } catch (e) {}
+    };
+    setInterval(send, 150);
+    send();
+  }
+
+  // ---- Apply a peer state: roster, kill relay, spawn alignment ----
+  coopApplyPeer(st) {
+    if (!st || st.playerId === this.myPid) return;
+    const idx = this.coopPlayers.findIndex(p => p.playerId === st.playerId);
+    if (idx >= 0) this.coopPlayers[idx] = st; else this.coopPlayers.push(st);
+    this._peerLastSeen.set(st.playerId, performance.now());
+    const now = performance.now();
+    this.coopPlayers = this.coopPlayers.filter(p => now - (this._peerLastSeen.get(p.playerId) || 0) < 2500);
+
+    // --- Zombie kill relay: peer snapshot diff -> confirm 2 misses -> kill twin here.
+    if (Array.isArray(st.zb)) {
+      const prev = this._peerZb.get(st.playerId);
+      const nowIds = new Set(st.zb.map(e => e[0]));
+      const missMap = this._peerZbMiss.get(st.playerId) || new Map();
+      if (prev) {
+        for (const [id, x, y, z] of prev) {
+          if (nowIds.has(id)) { missMap.delete(id); continue; }
+          const streak = (missMap.get(id) || 0) + 1;
+          if (streak >= 2) {
+            missMap.delete(id);
+            if (this.killLocalZombieNear(x, y, z)) {
+              this.pushKillFeed(`💀 ${st.name || 'Peer'} killed a zombie (synced)`);
             }
+          } else {
+            missMap.set(id, streak);
           }
         }
-      } catch (err) {}
-    }, 45); // 22Hz Real-time state sync
+      }
+      this._peerZbMiss.set(st.playerId, missMap);
+      this._peerZb.set(st.playerId, st.zb);
+    }
+
+    if (!this._spawnAligned && !this.partyData?.isHost && st.isHost) this.alignInitialSpawn(st);
+  }
+
+  // ---- Kill the local zombie twin nearest to a peer-reported death position ----
+  killLocalZombieNear(x, y, z, tol = 130) {
+    const memCtx = this.getMemoryContext();
+    if (!memCtx || !memCtx.centitiesBase || !memCtx.heapU8) return false;
+    const { heapU8, heapU16, heapF32, centitiesBase } = memCtx;
+    let best = -1, bestD = tol;
+    for (let i = 1; i < 1024; i++) {
+      const entPtr = centitiesBase + i * 808;
+      if (entPtr + 808 > heapU8.byteLength) break;
+      if ((heapU8[entPtr + 804] & 2) === 0) continue;          // not in scene
+      const eType = heapU16[(entPtr + 678) / 2];
+      if (eType !== 17 && eType !== 19) continue;               // not an actor
+      if ((heapU8[entPtr + 494] & 4) !== 0) continue;           // already corpse
+      const ex = heapF32[(entPtr + 48) / 4], ey = heapF32[(entPtr + 52) / 4], ez = heapF32[(entPtr + 56) / 4];
+      if (!Number.isFinite(ex) || (ex === 0 && ey === 0 && ez === 0)) continue;
+      const d = Math.hypot(ex - x, ey - y, ez - z);
+      if (d <= bestD) { bestD = d; best = i; }
+    }
+    if (best < 0) return false;
+    const ptr = centitiesBase + best * 808;
+    heapU8[ptr + 494] |= 4; // ACTOR_FLAG_CORPSE — engine's own dead flag
+    // Push REAL engine damage through the console so health/gore stay consistent:
+    try {
+      const sx = x.toFixed(1), sy = y.toFixed(1), sz = (z + 96).toFixed(1), dz = z.toFixed(1);
+      this.cmd(`magicbullet ray_gun_upgraded_zm ${sx} ${sy} ${sz} ${sx} ${sy} ${dz}`);
+    } catch (e) {}
+    return true;
+  }
+
+  // ---- Real kill counter: local alive-set diffing ----
+  trackLocalKills(zombies) {
+    const nowIds = new Set(zombies.map(z => z.id));
+    if (this._prevAliveIds) {
+      for (const id of this._prevAliveIds) {
+        if (!nowIds.has(id)) this.localKills++;
+      }
+    }
+    this._prevAliveIds = nowIds;
+  }
+
+  // ---- Kill feed / co-op event overlay ----
+  pushKillFeed(text) {
+    this.killFeed.push({ text: String(text).slice(0, 90), t: performance.now() });
+    if (this.killFeed.length > 6) this.killFeed.shift();
+  }
+
+  drawKillFeed(ctx) {
+    const now = performance.now();
+    this.killFeed = this.killFeed.filter(k => now - k.t < 5000);
+    if (!this.killFeed.length) return;
+    ctx.save();
+    ctx.font = 'bold 12px -apple-system, sans-serif';
+    this.killFeed.forEach((k, i) => {
+      const age = (now - k.t) / 5000;
+      ctx.globalAlpha = Math.max(0, 1 - age * age);
+      const tw = ctx.measureText(k.text).width;
+      ctx.fillStyle = 'rgba(8, 12, 18, 0.78)';
+      ctx.fillRect(14, 64 + i * 20, tw + 14, 17);
+      ctx.fillStyle = '#e5e7eb';
+      ctx.fillText(k.text, 21, 77 + i * 20);
+    });
+    ctx.globalAlpha = 1;
+    ctx.restore();
   }
 
   showScoreboard() {
@@ -396,13 +585,9 @@ class ModMenuManager {
     }
     if (!sb) return;
 
-    let party = null;
-    try {
-      party = JSON.parse(sessionStorage.getItem('bo1z-online-party') || '{}');
-    } catch (e) {}
-
-    const myName = (party?.room?.players || []).find(p => p.id === party?.playerId)?.name || (party?.isHost ? 'Host' : 'Player');
-    const isHost = Boolean(party?.isHost);
+    const isHost = Boolean(this.partyData?.isHost);
+    const myName = this.myName || 'You';
+    const ping = this.wsRtt ? `${this.wsRtt}ms` : this._httpFallbackActive ? 'poll' : '—';
 
     let rowsHtml = `
       <tr class="coop-sb-row ${isHost ? 'host-row' : 'client-row'}">
@@ -410,33 +595,35 @@ class ModMenuManager {
           <span class="coop-sb-badge ${isHost ? 'host' : 'client'}">${isHost ? '👑 HOST' : '🧟 CO-OP'}</span>
           <span>${myName} (You)</span>
         </td>
-        <td style="color: #60a5fa; font-weight: 700;">500</td>
-        <td>0</td>
-        <td>0</td>
+        <td style="color: #60a5fa; font-weight: 700;">${this._myScore ?? 500}</td>
+        <td>${this.localKills}</td>
+        <td>—</td>
         <td><span style="color: #10b981; font-weight: 600;">● ALIVE</span></td>
-        <td style="color: #9ca3af; font-family: monospace;">12ms</td>
+        <td style="color: #9ca3af; font-family: monospace;">${ping}</td>
       </tr>
     `;
 
     if (this.coopPlayers && this.coopPlayers.length > 0) {
       for (const other of this.coopPlayers) {
         const otherIsHost = Boolean(other.isHost);
+        const age = performance.now() - (this._peerLastSeen.get(other.playerId) || 0);
+        const alive = age < 1200;
         rowsHtml += `
           <tr class="coop-sb-row ${otherIsHost ? 'host-row' : 'client-row'}">
             <td class="coop-sb-name">
               <span class="coop-sb-badge ${otherIsHost ? 'host' : 'client'}">${otherIsHost ? '👑 HOST' : '🧟 CO-OP'}</span>
               <span>${other.name || 'Friend'}</span>
             </td>
-            <td style="color: #60a5fa; font-weight: 700;">${other.score || 500}</td>
-            <td>${other.kills || 0}</td>
-            <td>${other.headshots || 0}</td>
-            <td><span style="color: #10b981; font-weight: 600;">● ALIVE</span></td>
-            <td style="color: #9ca3af; font-family: monospace;">22ms</td>
+            <td style="color: #60a5fa; font-weight: 700;">${other.sc ?? 500}</td>
+            <td>${other.k ?? 0}</td>
+            <td>—</td>
+            <td><span style="color: ${alive ? '#10b981' : '#f59e0b'}; font-weight: 600;">● ${alive ? 'ALIVE' : 'SYNC…'}</span></td>
+            <td style="color: #9ca3af; font-family: monospace;">${this.wsRtt ? this.wsRtt + 'ms' : '—'}</td>
           </tr>
         `;
       }
     } else {
-      const otherRoomPlayer = (party?.room?.players || []).find(p => p.id !== party?.playerId);
+      const otherRoomPlayer = (this.partyData?.room?.players || []).find(p => p.id !== this.myPid);
       if (otherRoomPlayer) {
         const oHost = Boolean(otherRoomPlayer.isHost);
         rowsHtml += `
@@ -445,11 +632,11 @@ class ModMenuManager {
               <span class="coop-sb-badge ${oHost ? 'host' : 'client'}">${oHost ? '👑 HOST' : '🧟 CO-OP'}</span>
               <span>${otherRoomPlayer.name}</span>
             </td>
-            <td style="color: #60a5fa; font-weight: 700;">500</td>
-            <td>0</td>
-            <td>0</td>
-            <td><span style="color: #10b981; font-weight: 600;">● CONNECTED</span></td>
-            <td style="color: #9ca3af; font-family: monospace;">24ms</td>
+            <td style="color: #60a5fa; font-weight: 700;">—</td>
+            <td>—</td>
+            <td>—</td>
+            <td><span style="color: #f59e0b; font-weight: 600;">● CONNECTING</span></td>
+            <td style="color: #9ca3af; font-family: monospace;">—</td>
           </tr>
         `;
       }
@@ -726,25 +913,6 @@ class ModMenuManager {
   getLiveZombies(memCtx) {
     if (!memCtx || !memCtx.camera.valid || !memCtx.centitiesBase) return [];
     const { heapF32, heapU16, heapU8, centitiesBase, camera } = memCtx;
-
-    // Co-op multiplayer: If Client has synced zombies from Host, return them for shared match state
-    if (this.hostSyncedZombies && this.hostSyncedZombies.length > 0 && this.partyData && !this.partyData.isHost) {
-      return this.hostSyncedZombies.map(hz => {
-        const dx = hz.x - camera.x;
-        const dy = hz.y - camera.y;
-        const dz = hz.z - camera.z;
-        const dist = Math.hypot(dx, dy, dz);
-        return {
-          id: hz.id,
-          x: hz.x,
-          y: hz.y,
-          z: hz.z,
-          distUnits: dist,
-          distMeters: Math.round(dist * 0.0254),
-          eType: 17
-        };
-      });
-    }
 
     const zombies = [];
 
@@ -1160,15 +1328,15 @@ class ModMenuManager {
       const hasCoop = Boolean(this.coopPlayers && this.coopPlayers.length > 0);
       const shouldDraw = this.state.esp || hasCoop;
 
-      // Direct in-engine 3D model & coordinate sync
-      if (hasCoop && memCtx) {
-        this.syncRemotePlayersToEngine(memCtx);
-      }
+      const nowT = performance.now();
+      const dtMs = this._lastEspT ? Math.min(100, nowT - this._lastEspT) : 16.7;
+      this._lastEspT = nowT;
 
       // If visual ESP overlay and co-op sync are disabled, skip canvas drawing
       if (!shouldDraw) {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         canvas.classList.remove('active');
+        this.coop3d.hide();
         this.espAnimFrame = requestAnimationFrame(render);
         return;
       }
@@ -1189,40 +1357,58 @@ class ModMenuManager {
 
       const cam = memCtx?.camera;
 
-      // ---------------- RENDER 3D CO-OP TEAMMATES & IN-MEMORY ENTITY UPDATE ----------------
-      if (hasCoop && cam && cam.valid) {
+      // Letterbox-correct rect of the engine canvas: every world projection maps here.
+      const gameEl = document.getElementById('game');
+      const gameRect = (gameEl && gameEl.getBoundingClientRect) ? gameEl.getBoundingClientRect()
+        : { left: 0, top: 0, width: w, height: h };
 
+      // Local zombie scan always runs in a party: kill tracking + ESP share one scan.
+      const zombies = (this.state.esp || hasCoop) ? this.getLiveZombies(memCtx) : [];
+      if (hasCoop) this.trackLocalKills(zombies);
+
+      // ---------------- TRUE 3D TEAMMATE SOLDIERS (WebGL, engine camera) ----------------
+      if (hasCoop && cam && cam.valid) {
+        const tms3d = [];
+        for (const tm of this.coopPlayers) {
+          if (typeof tm.x !== 'number' || !Number.isFinite(tm.x)) continue;
+          tms3d.push({
+            pid: tm.playerId || tm.name || 'p', x: tm.x, y: tm.y, z: tm.z,
+            yaw: tm.yaw || 0, pitch: tm.pitch || 0,
+            moving: Boolean(tm.mv), crouch: Boolean(tm.cr), dead: !tm.alive,
+            name: tm.name || 'Friend', isHost: Boolean(tm.isHost),
+          });
+        }
+        if (tms3d.length) this.coop3d.update(tms3d, cam, gameRect, dtMs);
+        else this.coop3d.hide();
+      } else {
+        this.coop3d.hide();
+      }
+
+      // ---------------- 2D TAGS: nametag / health / snapline (letterbox-correct) ----------------
+      if (hasCoop && cam && cam.valid) {
         for (const tm of this.coopPlayers) {
           if (typeof tm.x !== 'number') continue;
-          const dx = tm.x - cam.x;
-          const dy = tm.y - cam.y;
-          const dz = tm.z - cam.z;
-          const distUnits = Math.hypot(dx, dy, dz);
-          const distM = Math.round(distUnits * 0.0254);
-
-          const feet = this.projectWorldToScreen(tm.x, tm.y, tm.z, cam, w, h);
-          const head = this.projectWorldToScreen(tm.x, tm.y, tm.z + 68, cam, w, h);
-
-          if (feet && head) {
+          const feetP = projectToGameRect(tm.x, tm.y, tm.z, cam, gameRect);
+          const headP = projectToGameRect(tm.x, tm.y, tm.z + 68, cam, gameRect);
+          if (feetP && headP) {
+            const feet = { x: gameRect.left + feetP.x, y: gameRect.top + feetP.y };
+            const head = { x: gameRect.left + headP.x, y: gameRect.top + headP.y };
+            const distM = Math.round(feetP.distForward * 0.0254);
             const bHeight = Math.max(20, feet.y - head.y);
             const bWidth = Math.max(12, bHeight * 0.45);
-            const bTop = head.y;
-
-            // 1. Draw Real 3D Tactical Soldier Character Model & Uniform
-            this.drawTacticalSoldier(ctx, feet.x, head.y, feet.y, bHeight, bWidth, tm.isHost, tm);
 
             ctx.save();
-            // 2. Snapline to feet
+            // Snapline from bottom-center of the GAME rect (not the window)
             ctx.beginPath();
             ctx.strokeStyle = tm.isHost ? 'rgba(245, 158, 11, 0.45)' : 'rgba(16, 185, 129, 0.45)';
             ctx.setLineDash([4, 4]);
-            ctx.moveTo(w / 2, h - 20);
+            ctx.moveTo(gameRect.left + gameRect.width / 2, gameRect.top + gameRect.height - 20);
             ctx.lineTo(feet.x, feet.y);
             ctx.stroke();
             ctx.setLineDash([]);
 
-            // 3. Floating 3D Nametag badge above head
-            const tagY = bTop - 18;
+            // Floating nametag above the 3D soldier's head
+            const tagY = head.y - 18;
             const tagText = `${tm.isHost ? '👑' : '🧟'} ${tm.name || 'Friend'} [${distM}m]`;
             ctx.font = 'bold 11px -apple-system, sans-serif';
             const tagW = ctx.measureText(tagText).width + 16;
@@ -1239,23 +1425,23 @@ class ModMenuManager {
             ctx.fillStyle = '#ffffff';
             ctx.fillText(tagText, tagX + 8, tagY - 1);
 
-            // 4. Health bar
+            // Readiness bar under the tag
             const hpW = Math.min(60, tagW);
             const hpX = feet.x - hpW / 2;
             ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
             ctx.fillRect(hpX, tagY + 6, hpW, 3);
             ctx.fillStyle = '#10b981';
-            ctx.fillRect(hpX, tagY + 6, hpW * ((tm.health || 100) / 100), 3);
-
+            ctx.fillRect(hpX, tagY + 6, hpW * ((tm.sc || 500) > 0 ? 1 : 0.2), 3);
             ctx.restore();
           } else {
-            // Teammate is off-screen or behind player: Draw 3D radar directional indicator
+            // Teammate off-screen: 3D radar directional indicator (window-space, fine)
             this.drawOffscreenIndicator(ctx, tm, cam, w, h);
           }
         }
       }
 
-      const zombies = this.state.esp ? this.getLiveZombies(memCtx) : [];
+      // Co-op event feed
+      this.drawKillFeed(ctx);
 
 
       // 2. Draw Real 2D Bounding Boxes on 3D Screen
@@ -1269,11 +1455,12 @@ class ModMenuManager {
             closestZombie = z;
           }
 
-          // Project Zombie feet (z.z) and head (z.z + 64 units)
-          const feet = this.projectWorldToScreen(z.x, z.y, z.z, cam, w, h);
-          const head = this.projectWorldToScreen(z.x, z.y, z.z + 64, cam, w, h);
-
-          if (!feet || !head) continue;
+          // Project Zombie feet (z.z) and head (z.z + 64 units) — letterbox-correct
+          const feetP = projectToGameRect(z.x, z.y, z.z, cam, gameRect);
+          const headP = projectToGameRect(z.x, z.y, z.z + 64, cam, gameRect);
+          if (!feetP || !headP) continue;
+          const feet = { x: gameRect.left + feetP.x, y: gameRect.top + feetP.y };
+          const head = { x: gameRect.left + headP.x, y: gameRect.top + headP.y };
 
           const boxHeight = feet.y - head.y;
           if (boxHeight <= 4 || boxHeight > h * 1.6) continue;
