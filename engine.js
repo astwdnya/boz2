@@ -321,18 +321,35 @@ export function createEngine(canvas, state) {
     }
     progress('wasm', null, 'Loading the game engine…');
     const { default: createKisakBrowser } = await import(BASE + 'artifacts/KisakBlack-web.mjs');
+    // coop6 FIX: resolve the co-op role BEFORE the patch decision. v5 read
+    // globalThis.__coopRole here but only assigned it AFTER createKisakBrowser
+    // had already booted the unpatched engine, so the patched binary never
+    // loaded (__coopPatched stayed false) and co-op silently degraded into
+    // two separate solo games — no remote players, different seeds/zombies.
+    const coopQuery = new URLSearchParams(location.search).get('coop');
+    const coopSessionJoin = (() => { try {
+      // coop5: the flag STAYS for the whole tab session - a guest who
+      // reloads mid-game must boot the patched binary again and rejoin
+      // (native mid-game join), not silently fall back to solo.
+      return sessionStorage.getItem('bo1z-coop-join');
+    } catch (e) { return null; } })();
+    const coopJoin = coopQuery === 'join' || coopSessionJoin === '1';
+    let coopHost = false;
+    try { coopHost = JSON.parse(sessionStorage.getItem('bo1z-online-party') || 'null')?.isHost === true; } catch (e) {}
+    const coopRole = coopHost ? 'host' : (coopJoin ? 'guest' : null);
+    globalThis.__coopRole = coopRole;
     // coop5: co-op roles boot a patched binary (server freeze switch,
     // server-thread command mailbox, extra inbound queue, multiplayer crash
     // fixes — see coop-patch.js). Solo pages keep the unmodified engine.
     let wasmBinary = null;
-    if (globalThis.__coopRole) {
+    if (coopRole) {
       try {
         const { patchEngine, COOP_BUILD } = await import(BASE + 'coop-patch.js');
         const wasmResponse = await fetch(BASE + 'artifacts/KisakBlack-web.wasm');
         if (!wasmResponse.ok) throw new Error(`wasm fetch ${wasmResponse.status}`);
-        wasmBinary = patchEngine(new Uint8Array(await wasmResponse.arrayBuffer()), COOP_BUILD, globalThis.__coopRole);
+        wasmBinary = patchEngine(new Uint8Array(await wasmResponse.arrayBuffer()), COOP_BUILD, coopRole);
         globalThis.__coopPatched = true;
-        log(`KISAK_BROWSER coop-patch ${globalThis.__coopRole} ok`);
+        log(`KISAK_BROWSER coop-patch ${coopRole} ok`);
       } catch (e) {
         wasmBinary = null;
         globalThis.__coopPatched = false;
@@ -431,19 +448,9 @@ export function createEngine(canvas, state) {
     //  - client: NO devmap at all - the engine boots to the native main menu
     //    and coopnet.js runs `connect localhost` once the host's server is up;
     //    the map/gamestate then arrive over the native snapshot protocol.
-    const coopQuery = new URLSearchParams(location.search).get('coop');
-    const coopSessionJoin = (() => { try {
-      // coop5: the flag STAYS for the whole tab session - a guest who
-      // reloads mid-game must boot the patched binary again and rejoin
-      // (native mid-game join), not silently fall back to solo.
-      return sessionStorage.getItem('bo1z-coop-join');
-    } catch (e) { return null; } })();
-    const coopJoin = coopQuery === 'join' || coopSessionJoin === '1';
-    let coopHost = false;
-    try { coopHost = JSON.parse(sessionStorage.getItem('bo1z-online-party') || 'null')?.isHost === true; } catch (e) {}
-    // coop5: which engine binary variant this tab needs (see coop-patch.js).
-    const coopRole = coopHost ? 'host' : (coopJoin ? 'guest' : null);
-    globalThis.__coopRole = coopRole;
+    // coop6: the co-op role was already resolved BEFORE the engine binary
+    // was fetched (see the patch block near the top of start()); the values
+    // computed there are reused here to size the host's native server.
     if (coopHost) {
       args.splice(args.indexOf('+devmap'), 0,
         '+set', 'sv_maxclients', '4',

@@ -38,6 +38,13 @@
 // `connect localhost` once the host reports its server is ready.
 // (v4.2 fix: `connect loopback` was rejected by NET_StringToAdr ->
 //  Com_ERROR "Bad server address" killed the member engine.)
+//
+// v6: virtual endpoints (the guest's queue[1] once its own server parks; the
+// host's per-seat reply queues) are drained WITH CONSUME - the bridge advances
+// the engine's get counter (the reference pump's QueueReader{consume:true}
+// does exactly this) so the 16-slot ring cannot fill and silently drop the
+// handshake or the snapshot stream. ws->engine injects are buffered instead
+// of dropped when the target ring is momentarily full.
 // ------------------------------------------------------------
 
 const LOOP_BASE = 135783616;   // &queue[0]
@@ -109,6 +116,8 @@ export class CoopNativeBridge {
     this.handlers = new Map();   // queueIndex -> (bytes, port) => void
     this.relayLog = [];          // ring of {t, dir, bytes} for diagnostics
     this.pending = [];           // packets staged before attach
+    this.consumes = new Set();   // v6: queues whose engine get counter WE advance
+    this.retry = new Map();      // v6: qi -> [{bytes,port}] injects waiting for ring room
     this.u16 = null;             // Uint16Array over the live buffer (netadr ports)
     this._cmdBuf = 0;            // malloc'd mailbox command buffer
   }
@@ -155,6 +164,7 @@ export class CoopNativeBridge {
     this.stopPolling();
     this.module = null; this.u8 = null; this.i32 = null; this.u16 = null; this.atomics = null;
     this.cursors.clear(); this.handlers.clear();
+    this.consumes.clear(); this.retry.clear();
     this.pending = [];
   }
 
@@ -230,8 +240,9 @@ export class CoopNativeBridge {
 
   // Register a consumer for packets arriving in queue[qi] that the engine
   // itself will never read (our virtual endpoints). One handler per queue.
-  onQueue(qi, handler) {
+  onQueue(qi, handler, opts) {
     this.handlers.set(qi, handler);
+    if (opts && opts.consume) this.consumes.add(qi);
     // Start at the live edge ONLY when the engine memory is already bound.
     // Before attach we have no view at all — drainOnce() initializes the
     // cursor at the live edge on the first attached drain instead. Reading a
@@ -248,9 +259,48 @@ export class CoopNativeBridge {
     if (!this.handlers.size) this.stopPolling();
   }
 
+  // Turn the bridge into the queue's consumer (advance the engine's get
+  // counter as we drain). The guest flips its client->server queue to
+  // consume exactly when its local server parks; the host registers every
+  // guest seat queue as consuming from the start. Never enable this while
+  // the engine's own reader is still running - it would STEAL its packets.
+  setConsume(qi, on) {
+    if (on) this.consumes.add(qi); else this.consumes.delete(qi);
+  }
+
+  // ws -> engine inject that survives a transiently full ring (a gamestate
+  // burst outruns the client's read loop). Buffered per queue, flushed in
+  // order by drainOnce; bounded so a dead engine cannot grow it forever.
+  injectReliable(qi, bytes, port) {
+    if (!this._ensureLive()) return false;
+    const list = this.retry.get(qi);
+    if (list && list.length) {
+      if (list.length >= 256) { list.shift(); this._log('ovf', qi, 0, port); }
+      list.push({ bytes, port });
+      return false;
+    }
+    if (this.injectSync(qi, bytes, port)) return true;
+    this.retry.set(qi, [{ bytes, port }]);
+    this.startPolling();
+    return false;
+  }
+
+  _flushRetries() {
+    if (!this.retry.size || !this.i32) return;
+    for (const qi of [...this.retry.keys()]) {
+      const list = this.retry.get(qi);
+      while (list.length) {
+        if (!this.injectSync(qi, list[0].bytes, list[0].port)) break;
+        list.shift();
+      }
+      if (!list.length) this.retry.delete(qi);
+    }
+  }
+
   // Read every new slot our cursor has not yet consumed.
   drainOnce() {
     if (!this._ensureLive()) return;
+    this._flushRetries();
     for (const [qi, handler] of this.handlers) {
       const base = this.qBase(qi);
       const send = Atomics.load(this.i32, (base + OFF_SEND) >> 2);
@@ -276,6 +326,10 @@ export class CoopNativeBridge {
         cur = (cur + 1) | 0;
       }
       this.cursors.set(qi, cur);
+      // Virtual endpoint: with the engine-side reader parked, WE are the
+      // consumer - advance the engine's get counter or the 16-slot ring
+      // fills up and every further engine send is dropped silently.
+      if (this.consumes.has(qi)) Atomics.store(this.i32, (base + OFF_GET) >> 2, cur);
     }
   }
 

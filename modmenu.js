@@ -189,6 +189,7 @@ function getWeaponSvg(type, cat) {
 // ========================================================
 class ModMenuManager {
   constructor() {
+    this.initLogCapture();
     this.isOpen = false;
     this.activeTab = 'cheats';
     this.searchQuery = '';
@@ -397,6 +398,9 @@ class ModMenuManager {
     this._injectOn = false;           // guest: relay host packets into queue[0]
     this._heldAt = 0; this._connectAt = 0; this._introFreed = false;
     this._resumeReleases = 0; this._coopPaused = false;
+    this._patchWarned = false; this._lastJoinState = -1;
+    this._netStats = { out: 0, in: 0, bytesOut: 0, bytesIn: 0 };
+    this._statTick = 0;
     this.bridge = new CoopNativeBridge();
 
     let ws = null, wsOk = false, reconnectDelay = 1000;
@@ -406,8 +410,9 @@ class ModMenuManager {
         try { ws.send(JSON.stringify(to == null ? { t: 'ctl', m } : { t: 'ctl', to, m })); } catch (e) {}
       }
     };
-    const guestPhase = (ph) => { this._guestPhase = ph; if (!isHost) sendCtl({ ph }); };
+    const guestPhase = (ph) => { this._guestPhase = ph; if (!isHost) sendCtl({ ph }); this.pushLog('coop', 'info', `phase: ${ph}`); };
     const now = () => performance.now();
+    const coopLog = (text, kind) => this.pushLog('coop', 'info', String(text));
 
     // ---- host: allocate the guest queue block once the bridge is live -----
     const hostAttachQueues = () => {
@@ -421,20 +426,32 @@ class ModMenuManager {
         this._seatDrains.set(seat, port);
         // The host's server writes this guest's packets to queue[port]
         // (net_from.port of that guest). Relay them tagged with the seat.
+        // v6: this queue has no engine-side reader (the server writes it FOR
+        // the guest) — the bridge MUST consume it or the ring fills after 16
+        // packets and the guest stops receiving snapshots.
         this.bridge.onQueue(port, (bytes) => {
           if (wsOk && ws?.readyState === 1) {
             const frame = new Uint8Array(bytes.length + 1);
             frame[0] = seat; frame.set(bytes, 1);
             try { ws.send(frame); } catch (e) {}
+            this._netStats.out++; this._netStats.bytesOut += bytes.length;
           }
-        });
+        }, { consume: true });
       }
       this.pushKillFeed(`Co-op host bridge live (inbound queue ${q.inbound.port})`);
     };
 
     // ---- host: one guest connects at a time (join turns) -------------------
     const hostTick = () => {
-      if (!this.bridge.patched()) return;
+      if (!this.bridge.patched()) {
+        if (!this._patchWarned && this.bridge.isAttached()) {
+          this._patchWarned = true;
+          const line = 'Co-op host: engine patch inactive — guests cannot join (reload the page)';
+          this.pushKillFeed(line); coopLog(line, 'net');
+          console.error('[COOPNET]', line, 'patched=', globalThis.__coopPatched, 'role=', globalThis.__coopRole);
+        }
+        return;
+      }
       hostAttachQueues();
       const t = Date.now();
       if (this._grantSeat && t - this._grantAt > 60000) this._grantSeat = 0;
@@ -463,7 +480,15 @@ class ModMenuManager {
     // `connect localhost`, and the native T5 handshake runs over the relay.
     const guestTick = () => {
       const bridge = this.bridge;
-      if (!bridge.patched()) return;
+      if (!bridge.patched()) {
+        if (!this._patchWarned && bridge.isAttached()) {
+          this._patchWarned = true;
+          const line = 'Co-op: engine patch inactive — join disabled (reload the page)';
+          this.pushKillFeed(line); coopLog(line, 'net');
+          console.error('[COOPNET]', line, 'patched=', globalThis.__coopPatched, 'role=', globalThis.__coopRole);
+        }
+        return;
+      }
       const screen = document.body?.dataset?.screen;
       if (bridge.isAttached() && screen === 'playing' && this._guestPhase === 'idle') guestPhase('waiting');
 
@@ -476,16 +501,23 @@ class ModMenuManager {
           }
           break;
         case 'parking':
+          bridge.keepClientAlive();       // our client still talks to the parked server
           // give the parked server a moment to stop reading its queue
           if (!bridge.serverReadsPackets() || now() - this._heldAt > 3000) {
             bridge.setDvar('svPaused', 0);
+            // v6: the bridge now OWNS queue[1] — without advancing the
+            // engine's get counter the ring fills with the client's outgoing
+            // packets and the OOB `connect` would be dropped forever.
+            bridge.setConsume(Q_SV_IN, true);
             this._dropUntilConnect = true;  // skip client<->own-server chatter
             this._injectOn = false;         // nothing from the host yet
             this._introFreed = false;
             guestPhase('connecting');
+            coopLog('local server parked — queue[1] now consumed by the bridge', 'net');
           }
           break;
         case 'connecting': {
+          bridge.keepClientAlive();
           // free the intro-hold so the first frames of the joined game render
           if (!this._introFreed) {
             let ui = 1;
@@ -508,29 +540,47 @@ class ModMenuManager {
         }
         case 'handshaking': {
           const st = bridge.connectionState();
+          bridge.keepClientAlive();
+          if (bridge.dvar('clPaused')) bridge.setDvar('clPaused', 0);
+          if (bridge.dvar('svPaused')) bridge.setDvar('svPaused', 0);
           if (st >= CONN_STATE.connecting && st <= CONN_STATE.challenging) {
             // The netchan is about to come up. Our server address MUST be
             // loopback:0 — the port the relay stamps on the host's packets —
             // or every gamestate packet is dropped by the address check and
             // the join freezes forever behind "click to resume".
             if (bridge.clientServerPort() !== 0) bridge.pointClientAt(0);
-            this._injectOn = true;
-            guestPhase('joining');
-            this.pushKillFeed('Handshake started, receiving host packets');
+            if (bridge.clientServerPort() === 0) {
+              this._injectOn = true;
+              guestPhase('joining');
+              this.pushKillFeed('Handshake started, receiving host packets');
+              coopLog(`handshake started (connState ${st}, qport ${this._guestQport})`, 'net');
+            } // else: retry next tick until the address sticks
           } else if (st === CONN_STATE.disconnected || now() - this._connectAt > 20000) {
+            coopLog(`join failed in handshaking (connState ${st})`, 'net');
             guestJoinFailed();
           }
           break;
         }
         case 'joining': {
           const st = bridge.connectionState();
+          bridge.keepClientAlive();
+          // the reference flow re-points every tick while joining and keeps
+          // the client unpaused — a drift back to :524 drops every snapshot.
+          if (bridge.clientServerPort() !== 0) bridge.pointClientAt(0);
+          if (bridge.dvar('clPaused')) bridge.setDvar('clPaused', 0);
+          if (bridge.dvar('svPaused')) bridge.setDvar('svPaused', 0);
           if (st === CONN_STATE.active) {
             this._v4Connected = true;
             this._resumeReleases = 5;
             this.pushKillFeed('Co-op joined: native engine sync active');
+            coopLog('JOIN COMPLETE — native engine sync active', 'net');
             guestPhase('ingame');
-          } else if ((st === CONN_STATE.disconnected && now() - this._connectAt > 15000) || now() - this._connectAt > 90000) {
-            guestJoinFailed();
+          } else {
+            if (st !== this._lastJoinState) { this._lastJoinState = st; coopLog(`join progress: connState ${st}`, 'net'); }
+            if ((st === CONN_STATE.disconnected && now() - this._connectAt > 15000) || now() - this._connectAt > 90000) {
+              coopLog(`join failed in joining (connState ${st})`, 'net');
+              guestJoinFailed();
+            }
           }
           break;
         }
@@ -557,8 +607,10 @@ class ModMenuManager {
       this._granted = false;
       this._joinTries++;
       this.bridge.freeze(false);          // wake the solo game back up
+      this.bridge.setConsume(Q_SV_IN, false); // hand queue[1] back to the engine
       this._injectOn = false;
       this._dropUntilConnect = false;
+      this._lastJoinState = -1;
       if (this._joinTries <= 3) {
         this.pushKillFeed(`Join attempt ${this._joinTries} failed, retrying...`);
         guestPhase('waiting');
@@ -577,7 +629,8 @@ class ModMenuManager {
         try {
           ws.send(JSON.stringify({ t: 'join', room: this.roomId, pid: this.myPid,
             name: this.myName, isHost: isHost }));
-          this.pushKillFeed('Co-op v5: native relay connected');
+          this.pushKillFeed(`Co-op v6: native relay connected (${isHost ? 'host' : 'guest'})`);
+          this.pushLog('coop', 'info', `relay open: ${wsUrl}`);
         } catch (e) {}
       };
       ws.onmessage = (ev) => {
@@ -596,10 +649,12 @@ class ModMenuManager {
                 // The patched NET_GetLoopPacket feeds the server from this
                 // queue while its own is empty; slot port = the seat's
                 // malloc'd loopback port, so replies land in queue[port].
-                this.bridge.injectSync(this._hostInbound, pkt.subarray(1), port);
+                this.bridge.injectReliable(this._hostInbound, pkt.subarray(1), port);
+                this._netStats.in++; this._netStats.bytesIn += pkt.length - 1;
               }
             } else if (this._injectOn && this.bridge.isAttached()) {
-              this.bridge.injectSync(Q_CL_IN, pkt, 0);
+              this.bridge.injectReliable(Q_CL_IN, pkt, 0);
+              this._netStats.in++; this._netStats.bytesIn += pkt.length;
             }
             // Pre-inject host packets are dropped on purpose: the guest's
             // client is still inside its own local game until it connects.
@@ -609,19 +664,25 @@ class ModMenuManager {
           if (msg.t === 'hello') {
             this._mySeat = msg.seat || 0;
             this.bridge.attach();
+            this.pushLog('coop', 'info', `hello: seat=${this._mySeat} role=${isHost ? 'host' : 'guest'}`);
             if (!isHost) {
               // The guest's client writes its outgoing packets into queue[1].
               // Before the join handshake those are usercmds for its OWN
               // (parked) server — drop them until the OOB `connect` packet
               // marks the exact moment the host handshake begins.
+              // v6: registered WITHOUT consume — the engine's own (running)
+              // server still reads this queue while the guest plays solo;
+              // parking flips it to consume (see the parking phase).
               this.bridge.onQueue(Q_SV_IN, (bytes) => {
                 if (!wsOk || ws?.readyState !== 1) return;
                 if (this._dropUntilConnect) {
                   if (connectionlessCommand(bytes) !== 'connect') return;
                   this._dropUntilConnect = false;
                   this.pushKillFeed('Joining the host server...');
+                  coopLog('first OOB connect packet seen — forwarding to host', 'net');
                 }
                 try { ws.send(bytes); } catch (e) {}
+                this._netStats.out++; this._netStats.bytesOut += bytes.length;
               });
             }
           } else if (msg.t === 'ctl') {
@@ -689,6 +750,14 @@ class ModMenuManager {
         }
         if (wsOk && this.coopWs?.readyState === 1) {
           try { this.coopWs.send(JSON.stringify({ t: 'ping', ts: performance.now() })); } catch (e) {}
+        }
+        // v6: periodic relay/bridge snapshot into the Log tab (every 10s)
+        if (this.bridge?.isAttached() && Date.now() - (this._statTick || 0) > 10000) {
+          this._statTick = Date.now();
+          const ns = this._netStats || { in: 0, out: 0 };
+          const s = this.bridge.stats();
+          const q = (s.queues || []).map(x => `q${x.qi}:get${x.get}/send${x.send}/cur${x.cursor}`).join(' ');
+          this.pushLog('coop', 'info', `relay stats: out=${ns.out} in=${ns.in} conn=${this.bridge.connectionState()} ${q}`);
         }
       } catch (e) {}
     }, 2000);
@@ -808,6 +877,117 @@ class ModMenuManager {
   pushKillFeed(text) {
     this.killFeed.push({ text: String(text).slice(0, 90), t: performance.now() });
     if (this.killFeed.length > 6) this.killFeed.shift();
+    try { this.pushLog('coop', 'info', String(text)); } catch (e) {}
+  }
+
+  // ---- Log tab (لاگ): every log line, live --------------------------------
+  initLogCapture() {
+    if (window.__coopLogHooked) return;
+    window.__coopLogHooked = true;
+    this.logRing = [];
+    this._logFilter = 'all';
+    const self = this;
+    const fmt = (a) => {
+      if (typeof a === 'string') return a;
+      if (a instanceof Error) return a.stack || `${a.name}: ${a.message}`;
+      try { return JSON.stringify(a); } catch (e) { return String(a); }
+    };
+    const wrap = (level, origFn) => function (...args) {
+      try {
+        const text = args.map(fmt).join(' ').trim();
+        if (text) self.pushLog('engine', level, text);
+      } catch (e) {}
+      origFn.apply(console, args);
+    };
+    ['log', 'warn', 'error'].forEach((level) => {
+      const origFn = console[level].bind(console);
+      console[level] = wrap(level, origFn);
+    });
+    window.addEventListener('error', (ev) => {
+      try { self.pushLog('engine', 'error', 'window.onerror: ' + (ev.message || (ev.error && ev.error.message) || 'unknown')); } catch (e) {}
+    });
+    window.addEventListener('unhandledrejection', (ev) => {
+      const r = ev.reason;
+      try { self.pushLog('engine', 'error', 'unhandled rejection: ' + ((r && (r.stack || r.message)) || r)); } catch (e) {}
+    });
+    setInterval(() => this.logTick(), 1000);
+  }
+
+  pushLog(kind, level, text) {
+    if (!this.logRing) this.logRing = [];
+    this.logRing.push({ t: new Date(), kind, level, text: String(text).slice(0, 420) });
+    if (this.logRing.length > 900) this.logRing.splice(0, this.logRing.length - 900);
+  }
+
+  _logMatch(e, f) {
+    if (f === 'err') return e.level === 'error';
+    if (f === 'engine') return e.kind === 'engine';
+    if (f === 'net') return e.kind === 'coop' || /COOP|coop|KISAK|connect|CL_|SV_|relay|queue|join|seat|grant|srvready|hello/i.test(e.text);
+    return true;
+  }
+
+  logTick() {
+    const status = document.getElementById('cooplog-status');
+    const view = document.getElementById('cooplog-view');
+    if (!status && !view) return;
+    if (status) {
+      const patched = globalThis.__coopPatched === true;
+      const role = globalThis.__coopRole || null;
+      const roleFa = role === 'host' ? 'میزبان' : role === 'guest' ? 'مهمان' : 'تکی';
+      const st = this.bridge ? this.bridge.connectionState() : 0;
+      const ns = this._netStats || { in: 0, out: 0 };
+      const rtt = this.wsRtt != null ? `${this.wsRtt}ms` : '—';
+      status.textContent = `نقش: ${roleFa} | پچ موتور: ${patched ? 'فعال' : 'غیرفعال'} | فاز: ${this._guestPhase || '—'} | connState: ${st} | صندلی: ${this._mySeat ?? '—'} | پینگ: ${rtt} | بسته ↑${ns.out} ↓${ns.in}`;
+    }
+    if (view && document.getElementById('tab-log')?.classList.contains('active')) this.renderLog();
+  }
+
+  setLogFilter(f, el) {
+    this._logFilter = f;
+    document.querySelectorAll('#tab-log .dev-cat-pill').forEach(p => p.classList.remove('active'));
+    if (el) el.classList.add('active');
+    this.renderLog();
+  }
+
+  renderLog() {
+    const view = document.getElementById('cooplog-view');
+    if (!view) return;
+    const f = this._logFilter || 'all';
+    const rows = [];
+    for (const e of this.logRing || []) {
+      if (!this._logMatch(e, f)) continue;
+      const hh = `${String(e.t.getHours()).padStart(2, '0')}:${String(e.t.getMinutes()).padStart(2, '0')}:${String(e.t.getSeconds()).padStart(2, '0')}`;
+      const color = e.level === 'error' ? '#f87171' : e.level === 'warn' ? '#fbbf24' : e.kind === 'coop' ? '#34d399' : '#9ca3af';
+      rows.push(`<div class="cooplog-line"><span class="cooplog-t">${hh}</span><span style="color:${color}">${this.escapeHtml(e.text)}</span></div>`);
+    }
+    const stick = view.scrollTop + view.clientHeight >= view.scrollHeight - 40;
+    view.innerHTML = rows.slice(-500).join('') || '<div class="cooplog-line">— خالی —</div>';
+    if (stick) view.scrollTop = view.scrollHeight;
+  }
+
+  escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  copyLog() {
+    const f = this._logFilter || 'all';
+    const lines = (this.logRing || []).filter(e => this._logMatch(e, f))
+      .map(e => `[${e.t.toISOString()}][${e.kind}/${e.level}] ${e.text}`);
+    const text = lines.join('\n') || '(empty log)';
+    const done = () => this.toast('لاگ کپی شد');
+    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(done).catch(() => {});
+    else {
+      const ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); done(); } catch (e) {}
+      ta.remove();
+    }
+  }
+
+  clearLog() {
+    this.logRing = [];
+    this.renderLog();
+    this.toast('لاگ پاک شد');
   }
 
   drawKillFeed(ctx) {
@@ -2426,6 +2606,7 @@ class ModMenuManager {
     document.querySelectorAll('.dev-content, .mod-content').forEach(content => {
       content.classList.toggle('active', content.id === `tab-${tabId}`);
     });
+    if (tabId === 'log') this.renderLog();
   }
 
   renderWeaponsGrid() {
@@ -2598,6 +2779,7 @@ class ModMenuManager {
             <button class="dev-tab-btn active" data-tab="cheats">Cheats</button>
             <button class="dev-tab-btn" data-tab="weapons">Weapons</button>
             <button class="dev-tab-btn" data-tab="console">Console</button>
+            <button class="dev-tab-btn" data-tab="log">لاگ</button>
           </div>
 
           <!-- Close Icon -->
@@ -2775,6 +2957,23 @@ class ModMenuManager {
               <input type="text" id="console-cmd-input" class="dev-console-input" placeholder="Type console command (e.g. noclip, god, give ammo)..." onkeydown="if(event.key==='Enter')window.__modMenu.submitConsole()">
               <button class="dev-console-btn" onclick="window.__modMenu.submitConsole()">EXEC</button>
             </div>
+          </div>
+        </div>
+
+        <!-- TAB 4: Log (لاگ) — همه لاگ‌ها: موتور، شبکه، co-op -->
+        <div class="dev-content" id="tab-log">
+          <div class="cooplog-wrap">
+            <div class="cooplog-status" id="cooplog-status">…</div>
+            <div class="cooplog-toolbar">
+              <button class="dev-cat-pill active" data-logf="all" onclick="window.__modMenu.setLogFilter('all', this)">همه</button>
+              <button class="dev-cat-pill" data-logf="net" onclick="window.__modMenu.setLogFilter('net', this)">شبکه</button>
+              <button class="dev-cat-pill" data-logf="engine" onclick="window.__modMenu.setLogFilter('engine', this)">موتور</button>
+              <button class="dev-cat-pill" data-logf="err" onclick="window.__modMenu.setLogFilter('err', this)">خطا</button>
+              <span class="cooplog-spacer"></span>
+              <button class="dev-cmd-chip" onclick="window.__modMenu.copyLog()">کپی</button>
+              <button class="dev-cmd-chip" onclick="window.__modMenu.clearLog()">پاک</button>
+            </div>
+            <div class="dev-console-log cooplog-view" id="cooplog-view"></div>
           </div>
         </div>
       </div>
