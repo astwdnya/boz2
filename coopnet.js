@@ -52,8 +52,48 @@ const OFF_SEND = 20356;        // queue: u32 send counter (engine write cursor)
 export const Q_CL_IN = 0;      // queue[0]: packets addressed to the local client
 export const Q_SV_IN = 1;      // queue[1]: packets addressed to the local server
 
-export const SEAT_PORT_BASE = 7001;   // seat 1..3 -> loopback ports 7001..7003
+// v5: seat ports are no longer hard-coded. The host mallocs a queue block at
+// runtime (createGuestQueues) and derives loopback ports so that
+// base + port*STRIDE lands inside that malloc'd block — the server writes its
+// replies to queue[port] WITHOUT a bounds check, so those addresses must be
+// real allocations. The guest keeps its client qport in the seat's range.
+export const GUEST_QPORT_BASE = 1000; // guest qport = 1000 + 10000*(seat-1) + rand(1..9999)
 export const MAX_SEATS = 4;
+export const HOST_QPORT = 7;          // the host's own client (engine.js: +setqport 7)
+
+// ---- verified memory map of this build (see coop-patch.js) ------------------
+export const COOP_MEM = {
+  mailbox: { command: 148263172, freeze: 148263176, inboundRing: 148263180 },
+  server: {
+    allowNetPackets: 142494258,
+    clientsPtr: 142360860, clientStride: 544120,
+    clientState: 0, clientAddrType: 32, clientAddrPort: 40,
+  },
+  client: {
+    connectionState: 13391960,
+    clcPtr: 43783020, serverAddressPort: 24, lastPacketTime: 12,
+  },
+  dvars: { comSvRunning: 134904904, svPaused: 134904892, clPaused: 134904896, comMaxClients: 134904752 },
+  dvarValue: 24,
+  reservedPorts: [0, 1, 1773],
+};
+
+export const SLOT_STATE = Object.freeze({ free: 0, zombie: 1, reconnecting: 2, connected: 3, loading: 4, active: 5 });
+export const CONN_STATE = Object.freeze({ disconnected: 0, connecting: 4, challenging: 5, connected: 6, loading: 8, primed: 9, active: 10 });
+
+// The command word of a connectionless packet (0xFFFFFFFF prefix), such as
+// "connect" or "getchallenge"; otherwise null. Used to find the exact moment
+// a guest's client leaves its own server and starts the host handshake.
+export function connectionlessCommand(bytes) {
+  if (!bytes || bytes.length < 5 || bytes[0] !== 255 || bytes[1] !== 255 || bytes[2] !== 255 || bytes[3] !== 255) return null;
+  let end = 4;
+  while (end < bytes.length && end < 64 && bytes[end] !== 0 && bytes[end] !== 32 && bytes[end] !== 10) end += 1;
+  let s = '';
+  for (let i = 4; i < end; i++) s += String.fromCharCode(bytes[i]);
+  return s;
+}
+
+export function guestQport(seat) { return GUEST_QPORT_BASE + 10000 * (seat - 1) + 1 + Math.floor(Math.random() * 9999); }
 
 const POLL_MS = 5;
 const INJECT_MAX_WAIT_MS = 500;
@@ -69,6 +109,8 @@ export class CoopNativeBridge {
     this.handlers = new Map();   // queueIndex -> (bytes, port) => void
     this.relayLog = [];          // ring of {t, dir, bytes} for diagnostics
     this.pending = [];           // packets staged before attach
+    this.u16 = null;             // Uint16Array over the live buffer (netadr ports)
+    this._cmdBuf = 0;            // malloc'd mailbox command buffer
   }
 
   // Attach to the running engine module. Returns false until the module and
@@ -95,12 +137,14 @@ export class CoopNativeBridge {
     const buf = mod.HEAPU8?.buffer || mod.wasmMemory?.buffer || mod.HEAPF32?.buffer || mod.buffer;
     if (!buf) return false;
     if (this.u8 && this.u8.buffer === buf) return true; // still live
+    this.u16 = null;
     // The loopback queue region is touched by the engine as soon as the net
     // stack initializes; a sanity probe keeps us from binding to a wrong heap.
     const probe = LOOP_BASE + Q_STRIDE * (MAX_SEATS + 2);
     if (buf.byteLength < probe + 2048) return false;
     this.u8 = new Uint8Array(buf);
     this.i32 = new Int32Array(buf);
+    this.u16 = new Uint16Array(buf);
     this.atomics = this.i32; // SharedArrayBuffer-backed; Atomics.* usable
     return true;
   }
@@ -109,7 +153,7 @@ export class CoopNativeBridge {
 
   detach() {
     this.stopPolling();
-    this.module = null; this.u8 = null; this.i32 = null; this.atomics = null;
+    this.module = null; this.u8 = null; this.i32 = null; this.u16 = null; this.atomics = null;
     this.cursors.clear(); this.handlers.clear();
     this.pending = [];
   }
@@ -214,6 +258,12 @@ export class CoopNativeBridge {
       // The engine clamps lagging readers by dropping old packets
       // (get = send - 16); mirror that bound so cursors stay in range.
       if (send - cur > 16) cur = send - 16;
+      // A cursor AHEAD of send means the queue's counters were reset under us
+      // (createGuestQueues zeroes its malloc'd block, which can cover queues
+      // we already drained; the i32 wraparound lands here too). The engine
+      // treats the counters as monotonic, so this can only be a re-init:
+      // re-anchor at the live edge instead of spinning toward send forever.
+      if (cur > send) cur = send;
       while (cur !== send) {
         const slot = base + (cur & 15) * SLOT;
         const size = this.i32[slot + OFF_SIZE >> 2] | 0;
@@ -240,6 +290,124 @@ export class CoopNativeBridge {
     if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
   }
 
+  // ---- v5 engine controls (require the patched binary; see coop-patch.js) ----
+  // All of them are safe no-ops while detached so watchdog ticks can call them
+  // freely before the engine exists.
+
+  patched() { return globalThis.__coopPatched === true; }
+
+  int(addr) { return this.i32 ? Atomics.load(this.i32, addr >> 2) : 0; }
+  setInt(addr, v) { if (this.i32) Atomics.store(this.i32, addr >> 2, v | 0); }
+
+  // Hand a console command to the SERVER thread through the patched SV_Frame
+  // mailbox. False while the previous command has not been picked up yet.
+  command(text) {
+    if (!this._ensureLive()) return false;
+    // Never clobber an un-consumed command: the server thread clears the
+    // mailbox after taking it; a non-zero word means it has not run yet.
+    if (Atomics.load(this.i32, COOP_MEM.mailbox.command >> 2) !== 0) return false;
+    const bytes = new TextEncoder().encode(`${text}\n`);
+    if (bytes.length >= 1024) throw new RangeError('command too long');
+    if (!this._cmdBuf) this._cmdBuf = this.module._malloc(1024);
+    if (!this._cmdBuf) return false;
+    this.u8.set(bytes, this._cmdBuf);
+    this.u8[this._cmdBuf + bytes.length] = 0;
+    return Atomics.compareExchange(this.i32, COOP_MEM.mailbox.command >> 2, 0, this._cmdBuf) === 0;
+  }
+
+  // Park / unpark this engine's own server (guests park theirs while joining
+  // the host; the host parks nothing except during full-room pause).
+  freeze(on) { this.setInt(COOP_MEM.mailbox.freeze, on ? 1 : 0); }
+  serverReadsPackets() { return this.u8 && this.u8.length > COOP_MEM.server.allowNetPackets && this.u8[COOP_MEM.server.allowNetPackets] === 1; }
+  inboundRing(port) { this.setInt(COOP_MEM.mailbox.inboundRing, port | 0); }
+
+  connectionState() { return this.int(COOP_MEM.client.connectionState); }
+  clientConnection() { const p = this.int(COOP_MEM.client.clcPtr); return p || 0; }
+  // Make the local client talk to loopback `port` — a guest uses 0, where the
+  // relay injects the host's packets. `connect localhost` leaves the port at
+  // the engine's default (524), which can never match the injected packets.
+  pointClientAt(port) {
+    const clc = this.clientConnection();
+    if (!clc || !this.u16) return false;
+    Atomics.store(this.u16, (clc + COOP_MEM.client.serverAddressPort) >> 1, port & 0xffff);
+    return true;
+  }
+  clientServerPort() {
+    const clc = this.clientConnection();
+    return clc && this.u16 ? Atomics.load(this.u16, (clc + COOP_MEM.client.serverAddressPort) >> 1) : null;
+  }
+  // While 0, the client never declares its server timed out (a parked local
+  // server and a host that is still waiting in its lobby both look dead).
+  keepClientAlive() {
+    const clc = this.clientConnection();
+    if (clc) this.setInt(clc + COOP_MEM.client.lastPacketTime, 0);
+  }
+
+  dvar(name) {
+    const store = COOP_MEM.dvars[name];
+    if (store == null) return null;
+    const dvar = this.int(store);
+    return dvar ? this.int(dvar + COOP_MEM.dvarValue) : null;
+  }
+  setDvar(name, value) {
+    const store = COOP_MEM.dvars[name];
+    if (store == null) return false;
+    const dvar = this.int(store);
+    if (!dvar) return false;
+    this.setInt(dvar + COOP_MEM.dvarValue, value);
+    return true;
+  }
+
+  // Occupied server slots: [{ slot, state, loopback, port }] (host side).
+  serverSlots() {
+    if (!this.i32 || !this.u16) return [];
+    const clients = this.int(COOP_MEM.server.clientsPtr);
+    const out = [];
+    if (!clients) return out;
+    const count = Math.min(this.dvar('comMaxClients') ?? 0, 64);
+    for (let slot = 0; slot < count; slot++) {
+      const base = clients + slot * COOP_MEM.server.clientStride;
+      const state = this.int(base + COOP_MEM.server.clientState);
+      if (state === SLOT_STATE.free) continue;
+      out.push({
+        slot, state,
+        loopback: this.int(base + COOP_MEM.server.clientAddrType) === 2,
+        port: Atomics.load(this.u16, (base + COOP_MEM.server.clientAddrPort) >> 1),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Host only: malloc one block holding `guests + 2` loopback queues and pick
+   * ports so base + port*stride stays inside it. Seat s sends through port
+   * seats[s] (the server writes that guest's packets there) and all guests'
+   * packets come in through inbound.port (the patched NET_GetLoopPacket reads
+   * it while the engine's own queue is empty). The block is never freed.
+   */
+  createGuestQueues(guests) {
+    if (!this._ensureLive() || !this.module?._malloc) return null;
+    const lb = { stride: Q_STRIDE };
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const size = (guests + 2) * lb.stride + 64;
+      const block = this.module._malloc(size);
+      if (!block) return null;
+      this.u8.fill(0, block, block + size);
+      const first = Math.ceil((block - LOOP_BASE) / lb.stride);
+      const inbound = first + guests;
+      const ports = Array.from({ length: guests }, (_, i) => first + i);
+      const fits = (LOOP_BASE + (inbound + 1) * lb.stride) <= (block + size) &&
+                   (this.u8.buffer.byteLength >= block + size);
+      const clash = [...ports, inbound].some(p => COOP_MEM.reservedPorts.includes(p));
+      if (first >= 2 && inbound <= 65535 && fits && !clash) {
+        const seats = {};
+        ports.forEach((port, i) => { seats[i + 1] = { port, base: LOOP_BASE + port * lb.stride }; });
+        return { seats, inbound: { port: inbound, base: LOOP_BASE + inbound * lb.stride } };
+      }
+    }
+    return null;
+  }
+
   _log(dir, qi, size, port) {
     this.relayLog.push({ t: Date.now(), dir, qi, size, port });
     if (this.relayLog.length > 128) this.relayLog.shift();
@@ -254,7 +422,7 @@ export class CoopNativeBridge {
   }
 }
 
-// Convenience: the client's outgoing queue is always queue[1] and the engine
-// writes slot port 0 there; when relaying to the host we rewrite the port so
-// the host's server sees a distinct loopback client (the seat's virtual port).
-export function seatPort(seat) { return SEAT_PORT_BASE + seat - 1; }
+// v5 note: seat loopback ports now come from the host's createGuestQueues()
+// at runtime (they must address a real malloc'd block — the server writes to
+// queue[port] without a bounds check). Guest CLIENT qports come from
+// guestQport(seat); the host's own client is pinned to HOST_QPORT at boot.

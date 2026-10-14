@@ -321,9 +321,28 @@ export function createEngine(canvas, state) {
     }
     progress('wasm', null, 'Loading the game engine…');
     const { default: createKisakBrowser } = await import(BASE + 'artifacts/KisakBlack-web.mjs');
+    // coop5: co-op roles boot a patched binary (server freeze switch,
+    // server-thread command mailbox, extra inbound queue, multiplayer crash
+    // fixes — see coop-patch.js). Solo pages keep the unmodified engine.
+    let wasmBinary = null;
+    if (globalThis.__coopRole) {
+      try {
+        const { patchEngine, COOP_BUILD } = await import(BASE + 'coop-patch.js');
+        const wasmResponse = await fetch(BASE + 'artifacts/KisakBlack-web.wasm');
+        if (!wasmResponse.ok) throw new Error(`wasm fetch ${wasmResponse.status}`);
+        wasmBinary = patchEngine(new Uint8Array(await wasmResponse.arrayBuffer()), COOP_BUILD, globalThis.__coopRole);
+        globalThis.__coopPatched = true;
+        log(`KISAK_BROWSER coop-patch ${globalThis.__coopRole} ok`);
+      } catch (e) {
+        wasmBinary = null;
+        globalThis.__coopPatched = false;
+        log(`KISAK_BROWSER coop-patch failed (${e?.message || e}) — co-op disabled, solo continues`, true);
+      }
+      if (stopped) return;
+    }
     if (stopped) return;
     state.timings.engineStart = performance.now();
-    module = await createKisakBrowser({ canvas, noInitialRun: true,
+    module = await createKisakBrowser({ canvas, noInitialRun: true, wasmBinary,
       locateFile: name => BASE + 'artifacts/' + name,
       print: message => log(message), printErr: message => log(message, true),
       kisakProgress: progress,
@@ -414,18 +433,25 @@ export function createEngine(canvas, state) {
     //    the map/gamestate then arrive over the native snapshot protocol.
     const coopQuery = new URLSearchParams(location.search).get('coop');
     const coopSessionJoin = (() => { try {
-      const v = sessionStorage.getItem('bo1z-coop-join');
-      if (v) sessionStorage.removeItem('bo1z-coop-join'); // consume-once: never leaks into later solo boots
-      return v;
+      // coop5: the flag STAYS for the whole tab session - a guest who
+      // reloads mid-game must boot the patched binary again and rejoin
+      // (native mid-game join), not silently fall back to solo.
+      return sessionStorage.getItem('bo1z-coop-join');
     } catch (e) { return null; } })();
     const coopJoin = coopQuery === 'join' || coopSessionJoin === '1';
     let coopHost = false;
     try { coopHost = JSON.parse(sessionStorage.getItem('bo1z-online-party') || 'null')?.isHost === true; } catch (e) {}
+    // coop5: which engine binary variant this tab needs (see coop-patch.js).
+    const coopRole = coopHost ? 'host' : (coopJoin ? 'guest' : null);
+    globalThis.__coopRole = coopRole;
     if (coopHost) {
       args.splice(args.indexOf('+devmap'), 0,
         '+set', 'sv_maxclients', '4',
         '+set', 'com_maxclients', '4',
         '+set', 'party_maxplayers', '4');
+      // coop5: the host's own client takes a fixed low qport so guests
+      // (1000 + 10000*seat + rand) can never collide with it on the server.
+      args.splice(args.indexOf('+devmap'), 0, '+setqport', '7');
     }
     // Renderer: pipelined WebGPU by default when the adapter has every required
     // feature; WebGL2 otherwise. ?renderer=webgl2|webgpu overrides. The engine
@@ -501,11 +527,14 @@ export function createEngine(canvas, state) {
         gate.module = module; state.packGateExpected = gate.paths.length - gate.ready.size;
       } else await gate.bootReady;
     }
-    // coop4: a join client boots to the native main menu - no local map/server.
-    if (coopJoin) { const di = args.indexOf('+devmap'); if (di >= 0) args.splice(di, 2); }
+    // coop5: a join guest boots WITH its map (+devmap) exactly like solo —
+    // the proven native-join flow. The map never downloads over the connect
+    // path (its MP fastfiles are not in the pack and that path stalls the
+    // Database thread). modmenu.js parks the guest's local server and runs
+    // `connect localhost` once the host grants the turn.
     state.timings.callMain = performance.now();
     module.callMain(args);
-    if (coopJoin) {
+    if (false) { // coop5: removed — the guest now boots its own map like solo
       // A join client never prints "KISAK_BROWSER map-loaded" (no local map),
       // so the normal warmGate 'ready' would never fire. Drive readiness from
       // the native main menu appearing instead, with a bounded fallback.

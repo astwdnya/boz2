@@ -212,6 +212,24 @@ def ws_client_thread(conn, addr):
                 out = json.dumps({'t': 'srvready', 'p': client.pid},
                                  separators=(',', ':'))
                 ws_broadcast(client.room, out, exclude=client)
+            elif mtype == 'ctl' and client.room:
+                # Co-op v5: control messages between host and one guest
+                # (guest join phases, host join-turn grants). Routed like the
+                # binary relay: host -> a specific seat, guest -> the host.
+                m = msg.get('m') or {}
+                out = json.dumps({'t': 'ctl', 'p': client.pid, 'seat': client.seat,
+                                  'm': m}, separators=(',', ':'))
+                to = msg.get('to')
+                if client.is_host and to is not None:
+                    for c in ws_roommates(client.room, exclude=client):
+                        if not c.is_host and c.seat == to:
+                            c.send_text(out)
+                            break
+                elif not client.is_host:
+                    for c in ws_roommates(client.room, exclude=client):
+                        if c.is_host:
+                            c.send_text(out)
+                            break
             elif mtype == 's' and client.room:
                 out = json.dumps({'t': 's', 'p': client.pid, 's': msg.get('s', {})},
                                  separators=(',', ':'))

@@ -3,7 +3,7 @@
 // ========================================================
 
 import { CoopSoldier3D, projectToGameRect } from './coop3d.js';
-import { CoopNativeBridge, Q_SV_IN, Q_CL_IN, seatPort } from './coopnet.js';
+import { CoopNativeBridge, Q_SV_IN, Q_CL_IN, CONN_STATE, connectionlessCommand, guestQport } from './coopnet.js';
 
 const WEAPONS_DB = [
   // --- Wonder Weapons ---
@@ -384,40 +384,188 @@ class ModMenuManager {
     this._v4Native = true;
     this._v4Connected = false;
     this._srvReady = false;
-    this._connectAttempts = 0;
-    this._lastConnectAt = 0;
-    this._seatDrains = new Set();     // host: relayed loopback ports
+    this._seatDrains = new Map();     // host: seat -> malloc'd loopback queue port
+    this._hostInbound = 0;            // host: extra inbound queue the server reads
+    this._guestPhases = new Map();    // host: seat -> reported join phase
+    this._grantSeat = 0; this._grantAt = 0;
+    // guest join state machine (the proven native-join flow):
+    // waiting -> parking -> connecting -> handshaking -> joining -> ingame
+    this._guestPhase = 'idle';
+    this._guestQport = 0;
+    this._granted = false; this._joinTries = 0;
+    this._dropUntilConnect = false;   // guest: drop client->own-server chatter
+    this._injectOn = false;           // guest: relay host packets into queue[0]
+    this._heldAt = 0; this._connectAt = 0; this._introFreed = false;
+    this._resumeReleases = 0; this._coopPaused = false;
     this.bridge = new CoopNativeBridge();
 
     let ws = null, wsOk = false, reconnectDelay = 1000;
 
-    const ensureHostDrain = (seat) => {
-      const port = seatPort(seat);
-      if (this._seatDrains.has(port)) return;
-      this._seatDrains.add(port);
-      this.bridge.onQueue(port, (bytes) => {
-        if (wsOk && ws?.readyState === 1) {
-          const frame = new Uint8Array(bytes.length + 1);
-          frame[0] = seat & 0xff; frame.set(bytes, 1);
-          try { ws.send(frame); } catch (e) {}
-        }
-      });
+    const sendCtl = (m, to) => {
+      if (wsOk && ws?.readyState === 1) {
+        try { ws.send(JSON.stringify(to == null ? { t: 'ctl', m } : { t: 'ctl', to, m })); } catch (e) {}
+      }
+    };
+    const guestPhase = (ph) => { this._guestPhase = ph; if (!isHost) sendCtl({ ph }); };
+    const now = () => performance.now();
+
+    // ---- host: allocate the guest queue block once the bridge is live -----
+    const hostAttachQueues = () => {
+      if (!this.bridge.patched() || !this.bridge.isAttached() || this._seatDrains.size) return;
+      const q = this.bridge.createGuestQueues(3);
+      if (!q) { this.pushKillFeed('Co-op: guest queue allocation failed'); return; }
+      this.bridge.inboundRing(q.inbound.port);
+      this._hostInbound = q.inbound.port;
+      for (const seatKey of Object.keys(q.seats)) {
+        const seat = Number(seatKey), port = q.seats[seat].port;
+        this._seatDrains.set(seat, port);
+        // The host's server writes this guest's packets to queue[port]
+        // (net_from.port of that guest). Relay them tagged with the seat.
+        this.bridge.onQueue(port, (bytes) => {
+          if (wsOk && ws?.readyState === 1) {
+            const frame = new Uint8Array(bytes.length + 1);
+            frame[0] = seat; frame.set(bytes, 1);
+            try { ws.send(frame); } catch (e) {}
+          }
+        });
+      }
+      this.pushKillFeed(`Co-op host bridge live (inbound queue ${q.inbound.port})`);
     };
 
-    const tryConnect = () => {
-      // The client engine executes the real connect command; its CL then
-      // performs the T5 handshake against the host's server via the relay.
-      if (this._v4Connected || !wsOk) return;
-      // Never run connect through an unbound bridge: bind first or wait for
-      // the next watchdog tick (connect output goes to the engine queues).
-      if (!this.bridge.isAttached()) { this.bridge.attach(); return; }
-      const now = performance.now();
-      if (now - this._lastConnectAt < 12000) return;
-      if (this._connectAttempts >= 5) return;
-      this._lastConnectAt = now;
-      this._connectAttempts++;
-      this.cmd('connect localhost');
-      this.pushKillFeed(`Connecting to host's co-op server (try ${this._connectAttempts})...`);
+    // ---- host: one guest connects at a time (join turns) -------------------
+    const hostTick = () => {
+      if (!this.bridge.patched()) return;
+      hostAttachQueues();
+      const t = Date.now();
+      if (this._grantSeat && t - this._grantAt > 60000) this._grantSeat = 0;
+      if (this._grantSeat) {
+        const ph = this._guestPhases.get(this._grantSeat);
+        if (!ph || ph === 'ingame' || ph === 'failed') this._grantSeat = 0;
+      }
+      if (!this._grantSeat && this._srvReady && document.body?.dataset?.screen === 'playing') {
+        for (const [seat, ph] of this._guestPhases) {
+          if (ph === 'waiting') {
+            this._grantSeat = seat; this._grantAt = t;
+            sendCtl({ grant: 1 }, seat);
+            this.pushKillFeed(`Player ${seat + 1} may join now`);
+            break;
+          }
+        }
+      }
+    };
+
+    // ---- guest: the native-join state machine ------------------------------
+    // The guest boots its own map exactly like solo (all zones are local —
+    // the connect path's MP fastfiles are NOT in the pack and stall the
+    // Database thread). Once the host grants the turn, the guest parks its
+    // own listen server (otherwise it eats every packet the client sends to
+    // the host — the old "stuck on click to resume" bug), sends the real
+    // `connect localhost`, and the native T5 handshake runs over the relay.
+    const guestTick = () => {
+      const bridge = this.bridge;
+      if (!bridge.patched()) return;
+      const screen = document.body?.dataset?.screen;
+      if (bridge.isAttached() && screen === 'playing' && this._guestPhase === 'idle') guestPhase('waiting');
+
+      switch (this._guestPhase) {
+        case 'waiting':
+          if (this._srvReady && this._granted && bridge.isAttached()) {
+            bridge.freeze(true);            // park the local server: only the
+            this._heldAt = now();           // relay may read queue[1] now
+            guestPhase('parking');
+          }
+          break;
+        case 'parking':
+          // give the parked server a moment to stop reading its queue
+          if (!bridge.serverReadsPackets() || now() - this._heldAt > 3000) {
+            bridge.setDvar('svPaused', 0);
+            this._dropUntilConnect = true;  // skip client<->own-server chatter
+            this._injectOn = false;         // nothing from the host yet
+            this._introFreed = false;
+            guestPhase('connecting');
+          }
+          break;
+        case 'connecting': {
+          // free the intro-hold so the first frames of the joined game render
+          if (!this._introFreed) {
+            let ui = 1;
+            try { ui = globalThis.__kisakEngine?.uiState?.() ?? 1; } catch (e) {}
+            if (!(ui & 1)) {
+              this._introFreed = true;
+              try { globalThis.__kisakEngine?.resumeIntroRelease?.(); } catch (e) {}
+            }
+          }
+          if (!this._guestQport) this._guestQport = guestQport(this._mySeat || 1);
+          // CL_Connect_f resolves ONLY "localhost"; the loopback fast-path
+          // jumps straight to CA_CHALLENGING and the client's first packet is
+          // the OOB `connect "userinfo"` the host's server needs. setqport is
+          // mandatory: the engine asserts clc->qport != 0 in this path.
+          if (bridge.command(`setqport ${this._guestQport};connect localhost`)) {
+            this._connectAt = now();
+            guestPhase('handshaking');
+          }
+          break;
+        }
+        case 'handshaking': {
+          const st = bridge.connectionState();
+          if (st >= CONN_STATE.connecting && st <= CONN_STATE.challenging) {
+            // The netchan is about to come up. Our server address MUST be
+            // loopback:0 — the port the relay stamps on the host's packets —
+            // or every gamestate packet is dropped by the address check and
+            // the join freezes forever behind "click to resume".
+            if (bridge.clientServerPort() !== 0) bridge.pointClientAt(0);
+            this._injectOn = true;
+            guestPhase('joining');
+            this.pushKillFeed('Handshake started, receiving host packets');
+          } else if (st === CONN_STATE.disconnected || now() - this._connectAt > 20000) {
+            guestJoinFailed();
+          }
+          break;
+        }
+        case 'joining': {
+          const st = bridge.connectionState();
+          if (st === CONN_STATE.active) {
+            this._v4Connected = true;
+            this._resumeReleases = 5;
+            this.pushKillFeed('Co-op joined: native engine sync active');
+            guestPhase('ingame');
+          } else if ((st === CONN_STATE.disconnected && now() - this._connectAt > 15000) || now() - this._connectAt > 90000) {
+            guestJoinFailed();
+          }
+          break;
+        }
+        case 'ingame': {
+          // The host may keep its lobby open for minutes; a parked local
+          // server and a quiet host must never time the client out.
+          bridge.keepClientAlive();
+          const mem = this.getMemoryContext();
+          if (mem?.cgPtr && this._resumeReleases > 0) {
+            let ui = 1;
+            try { ui = globalThis.__kisakEngine?.uiState?.() ?? 1; } catch (e) {}
+            if (!(ui & 1)) {
+              this._resumeReleases--;
+              try { globalThis.__kisakEngine?.resumeIntroRelease?.(); } catch (e) {}
+            }
+          }
+          break;
+        }
+        default: break;
+      }
+    };
+
+    const guestJoinFailed = () => {
+      this._granted = false;
+      this._joinTries++;
+      this.bridge.freeze(false);          // wake the solo game back up
+      this._injectOn = false;
+      this._dropUntilConnect = false;
+      if (this._joinTries <= 3) {
+        this.pushKillFeed(`Join attempt ${this._joinTries} failed, retrying...`);
+        guestPhase('waiting');
+      } else {
+        this.pushKillFeed('Co-op join failed — reload the page to retry');
+        guestPhase('failed');
+      }
     };
 
     const connect = () => {
@@ -429,15 +577,13 @@ class ModMenuManager {
         try {
           ws.send(JSON.stringify({ t: 'join', room: this.roomId, pid: this.myPid,
             name: this.myName, isHost: isHost }));
-          this.pushKillFeed('Co-op v4: native relay connected');
+          this.pushKillFeed('Co-op v5: native relay connected');
         } catch (e) {}
       };
       ws.onmessage = (ev) => {
         // HARD RULE: nothing in this handler may ever throw. An uncaught error
         // from a WS event surfaces as a window-error and the engine wrapper
-        // shows the fatal "engine stopped unexpectedly" screen (field bug:
-        // Atomics.load(null) via onQueue->qSend before the bridge attached).
-        // Every path below is guarded; this outer catch is the last defense.
+        // shows the fatal "engine stopped unexpectedly" screen.
         try {
           // Binary frame = one native loopback packet from the peer side.
           if (ev.data instanceof ArrayBuffer) {
@@ -445,48 +591,62 @@ class ModMenuManager {
             if (isHost) {
               if (!pkt.length) return;
               const seat = pkt[0];
-              ensureHostDrain(seat);
-              if (this.bridge.isAttached()) {
-                this.bridge.injectSync(Q_SV_IN, pkt.subarray(1), seatPort(seat));
-              } else {
-                // Engine memory not bound yet: stage instead of dropping.
-                this.bridge.stage(Q_SV_IN, pkt.subarray(1), seatPort(seat));
+              const port = this._seatDrains.get(seat);
+              if (this._hostInbound && port && this.bridge.isAttached()) {
+                // The patched NET_GetLoopPacket feeds the server from this
+                // queue while its own is empty; slot port = the seat's
+                // malloc'd loopback port, so replies land in queue[port].
+                this.bridge.injectSync(this._hostInbound, pkt.subarray(1), port);
               }
-            } else if (this.bridge.isAttached()) {
+            } else if (this._injectOn && this.bridge.isAttached()) {
               this.bridge.injectSync(Q_CL_IN, pkt, 0);
-            } else {
-              this.bridge.stage(Q_CL_IN, pkt, 0);
             }
+            // Pre-inject host packets are dropped on purpose: the guest's
+            // client is still inside its own local game until it connects.
             return;
           }
           let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
           if (msg.t === 'hello') {
             this._mySeat = msg.seat || 0;
-            // hello usually beats the 2s watchdog by seconds: bind the engine
-            // NOW if the module already exists (idempotent; safe if not).
             this.bridge.attach();
             if (!isHost) {
-              // Client: the engine's outgoing packets land in queue[1]; this
-              // tab runs no server, so the bridge is their only consumer.
-              // Safe even when unattached: the cursor initializes at the live
-              // edge on the first successful attach (never Atomics-on-null).
+              // The guest's client writes its outgoing packets into queue[1].
+              // Before the join handshake those are usercmds for its OWN
+              // (parked) server — drop them until the OOB `connect` packet
+              // marks the exact moment the host handshake begins.
               this.bridge.onQueue(Q_SV_IN, (bytes) => {
-                if (wsOk && ws?.readyState === 1) { try { ws.send(bytes); } catch (e) {} }
+                if (!wsOk || ws?.readyState !== 1) return;
+                if (this._dropUntilConnect) {
+                  if (connectionlessCommand(bytes) !== 'connect') return;
+                  this._dropUntilConnect = false;
+                  this.pushKillFeed('Joining the host server...');
+                }
+                try { ws.send(bytes); } catch (e) {}
               });
+            }
+          } else if (msg.t === 'ctl') {
+            const m = msg.m || {};
+            if (isHost) {
+              if (m.ph && msg.seat) {
+                this._guestPhases.set(msg.seat, m.ph);
+                this.pushKillFeed(`Player ${msg.seat + 1}: ${m.ph}`);
+              }
+            } else if (m.grant) {
+              this._granted = true;
+              this.pushKillFeed('Host is ready — joining...');
             }
           } else if (msg.t === 'srvready') {
             if (!this._srvReady) this.pushKillFeed('Host server is live');
             this._srvReady = true;
           } else if (msg.t === 'gone') {
             if (isHost && msg.seat) {
-              const port = seatPort(msg.seat);
-              if (this._seatDrains.has(port)) { this.bridge.offQueue(port); this._seatDrains.delete(port); }
+              const port = this._seatDrains.get(msg.seat);
+              if (port != null) { this.bridge.offQueue(port); this._seatDrains.delete(msg.seat); }
+              this._guestPhases.delete(msg.seat);
+              if (this._grantSeat === msg.seat) this._grantSeat = 0;
             } else if (!isHost && msg.isHost) {
-              // The host (and its native server) is gone: allow a future srvready
-              // to trigger a fresh connect attempt.
               this._srvReady = false;
-              this._v4Connected = false;
-              this._connectAttempts = 0;
+              this._granted = false;
             }
             this.pushKillFeed(`${msg.n || 'Player'} left the game`);
           } else if (msg.t === 'pong') {
@@ -507,54 +667,42 @@ class ModMenuManager {
     window.addEventListener('beforeunload', () => {
       this._coopStopped = true;
       try { this.coopWs?.close(); } catch (e) {}
+      try { this.bridge?.freeze(false); } catch (e) {}
       this.bridge?.detach();
     });
 
-    // Watchdog: engine attach, host server heartbeat, client connect attempts.
+    // Watchdog: bridge binding, host heartbeat/announcements, ping.
     this._wsPingTimer = setInterval(() => {
       try {
         if (this._coopStopped) return;
         // attach() is idempotent and cheap; call it every tick so a grown WASM
-        // memory (fresh buffer object) is re-bound within 2s and packets that
-        // were staged before the engine existed get flushed early.
+        // memory (fresh buffer object) is re-bound within 2s.
         this.bridge.attach();
-
         if (isHost) {
-          // Announce the listen server while the tab is actually in-game.
-          if (document.body?.dataset?.screen === 'playing'
-              && wsOk && this.coopWs?.readyState === 1) {
-            this.coopWs.send(JSON.stringify({ t: 'srvready' }));
-          }
-        } else if (document.body?.dataset?.screen === 'playing') {
-          if (this._srvReady) tryConnect();
-          // In-game detection: the CG context exists only once the joined map
-          // is rendering. Flip to connected and stop retrying.
-          const mem = this.getMemoryContext();
-          if (mem?.cgPtr && !this._v4Connected) {
-            this._v4Connected = true;
-            // The engine re-arms its intro-hold (cl_paused) on every map load;
-            // a join client's map arrives long after play() consumed the
-            // one-shot release. Free the first frames of the joined game.
-            this._resumeReleases = 5;
-            this.pushKillFeed('Co-op joined: native engine sync active');
-          }
-          // Bounded re-release: the hold engages on the first rendered frame,
-          // shortly after cgPtr appears. Only while no game menu owns the
-          // screen (uiState bit 0), so real menus keep working.
-          if (this._v4Connected && this._resumeReleases > 0 && mem?.cgPtr) {
-            let ui = 1;
-            try { ui = globalThis.__kisakEngine?.uiState?.() ?? 1; } catch (e) {}
-            if (!(ui & 1)) {
-              this._resumeReleases--;
-              try { globalThis.__kisakEngine?.resumeIntroRelease?.(); } catch (e) {}
+          if (document.body?.dataset?.screen === 'playing') {
+            this._srvReady = true;
+            if (wsOk && this.coopWs?.readyState === 1) {
+              this.coopWs.send(JSON.stringify({ t: 'srvready' }));
             }
           }
+          hostTick();
         }
         if (wsOk && this.coopWs?.readyState === 1) {
           try { this.coopWs.send(JSON.stringify({ t: 'ping', ts: performance.now() })); } catch (e) {}
         }
       } catch (e) {}
     }, 2000);
+
+    // Guest phases need faster reactions than the 2s watchdog: the netchan
+    // comes up within milliseconds of the connect packet.
+    if (!isHost) {
+      this._guestTimer = setInterval(() => {
+        try {
+          if (this._coopStopped) return;
+          guestTick();
+        } catch (e) {}
+      }, 250);
+    }
   }
 
   coopStartHttpFallback() {
