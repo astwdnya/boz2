@@ -566,13 +566,15 @@ async function loadEngine() {
 async function enter() {
   if (locking || !engine) return;
   locking = true; play.disabled = true;
-  // Fullscreen is optional. Start all activation calls in this click, before await.
-  const full = $('fullscreen').checked && !document.fullscreenElement
-    ? document.documentElement.requestFullscreen().then(lockEscape, () => {
-      $('notice').textContent = 'Fullscreen unavailable.'; $('notice').hidden = false;
-    }) : Promise.resolve();
-  const playing = engine.play();
   try {
+    // Fullscreen is optional. Start all activation calls in this click, before
+    // await (a synchronous throw from play() must still land in the catch, or
+    // `locking` would stick and every later click would silently no-op).
+    const full = $('fullscreen').checked && !document.fullscreenElement
+      ? document.documentElement.requestFullscreen().then(lockEscape, () => {
+        $('notice').textContent = 'Fullscreen unavailable.'; $('notice').hidden = false;
+      }) : Promise.resolve();
+    const playing = engine.play();
     await Promise.all([full, playing]);
     if (document.pointerLockElement !== canvas) throw new Error('The mouse was not captured.');
     screen('playing', ''); state.timings.playing = performance.now();

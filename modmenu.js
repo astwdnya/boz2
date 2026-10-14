@@ -532,7 +532,22 @@ class ModMenuManager {
           const mem = this.getMemoryContext();
           if (mem?.cgPtr && !this._v4Connected) {
             this._v4Connected = true;
+            // The engine re-arms its intro-hold (cl_paused) on every map load;
+            // a join client's map arrives long after play() consumed the
+            // one-shot release. Free the first frames of the joined game.
+            this._resumeReleases = 5;
             this.pushKillFeed('Co-op joined: native engine sync active');
+          }
+          // Bounded re-release: the hold engages on the first rendered frame,
+          // shortly after cgPtr appears. Only while no game menu owns the
+          // screen (uiState bit 0), so real menus keep working.
+          if (this._v4Connected && this._resumeReleases > 0 && mem?.cgPtr) {
+            let ui = 1;
+            try { ui = globalThis.__kisakEngine?.uiState?.() ?? 1; } catch (e) {}
+            if (!(ui & 1)) {
+              this._resumeReleases--;
+              try { globalThis.__kisakEngine?.resumeIntroRelease?.(); } catch (e) {}
+            }
           }
         }
         if (wsOk && this.coopWs?.readyState === 1) {

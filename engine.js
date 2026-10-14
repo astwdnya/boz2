@@ -680,6 +680,14 @@ export function createEngine(canvas, state) {
     uiState: () => module ? module._KB_UIState() : 0,
     // intro6: play.js calls this when its load video ends, is skipped or is removed.
     introReady: () => releaseIntro(),
+    // coop4: the intro-hold re-arms on EVERY map load, but play() releases it
+    // only once. A join client runs play() at the native main menu and the
+    // network map arrives later — without a re-release the client stays
+    // cl_paused behind "Click to resume" forever. Idempotent for the engine.
+    resumeIntroRelease() {
+      state.introWanted = true; state.introReleased = false; releaseIntro();
+      state.timings.introRelease = performance.now();
+    },
     // loadvol: the cinematic master volume (video_bridge.js setMaster; before the bridge exists, start() reads state.videoMaster).
     videoMaster(value) { if (module?.kbVideo?.setMaster) module.kbVideo.setMaster(value); },
     describeMenu: () => module?._KB_Input(5, 0, 0),
