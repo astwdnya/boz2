@@ -408,6 +408,9 @@ class ModMenuManager {
       // The client engine executes the real connect command; its CL then
       // performs the T5 handshake against the host's server via the relay.
       if (this._v4Connected || !wsOk) return;
+      // Never run connect through an unbound bridge: bind first or wait for
+      // the next watchdog tick (connect output goes to the engine queues).
+      if (!this.bridge.isAttached()) { this.bridge.attach(); return; }
       const now = performance.now();
       if (now - this._lastConnectAt < 12000) return;
       if (this._connectAttempts >= 5) return;
@@ -430,49 +433,66 @@ class ModMenuManager {
         } catch (e) {}
       };
       ws.onmessage = (ev) => {
-        // Binary frame = one native loopback packet from the peer side.
-        if (ev.data instanceof ArrayBuffer) {
-          const pkt = new Uint8Array(ev.data);
-          try {
+        // HARD RULE: nothing in this handler may ever throw. An uncaught error
+        // from a WS event surfaces as a window-error and the engine wrapper
+        // shows the fatal "engine stopped unexpectedly" screen (field bug:
+        // Atomics.load(null) via onQueue->qSend before the bridge attached).
+        // Every path below is guarded; this outer catch is the last defense.
+        try {
+          // Binary frame = one native loopback packet from the peer side.
+          if (ev.data instanceof ArrayBuffer) {
+            const pkt = new Uint8Array(ev.data);
             if (isHost) {
               if (!pkt.length) return;
               const seat = pkt[0];
               ensureHostDrain(seat);
-              this.bridge.injectSync(Q_SV_IN, pkt.subarray(1), seatPort(seat));
-            } else {
+              if (this.bridge.isAttached()) {
+                this.bridge.injectSync(Q_SV_IN, pkt.subarray(1), seatPort(seat));
+              } else {
+                // Engine memory not bound yet: stage instead of dropping.
+                this.bridge.stage(Q_SV_IN, pkt.subarray(1), seatPort(seat));
+              }
+            } else if (this.bridge.isAttached()) {
               this.bridge.injectSync(Q_CL_IN, pkt, 0);
+            } else {
+              this.bridge.stage(Q_CL_IN, pkt, 0);
             }
-          } catch (e) { console.warn('[COOPNET] relay error', e); }
-          return;
-        }
-        let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
-        if (msg.t === 'hello') {
-          this._mySeat = msg.seat || 0;
-          if (!isHost) {
-            // Client: the engine's outgoing packets land in queue[1]; this tab
-            // runs no server, so the bridge is their only consumer.
-            this.bridge.onQueue(Q_SV_IN, (bytes) => {
-              if (wsOk && ws?.readyState === 1) { try { ws.send(bytes); } catch (e) {} }
-            });
+            return;
           }
-        } else if (msg.t === 'srvready') {
-          if (!this._srvReady) this.pushKillFeed('Host server is live');
-          this._srvReady = true;
-        } else if (msg.t === 'gone') {
-          if (isHost && msg.seat) {
-            const port = seatPort(msg.seat);
-            if (this._seatDrains.has(port)) { this.bridge.offQueue(port); this._seatDrains.delete(port); }
-          } else if (!isHost && msg.isHost) {
-            // The host (and its native server) is gone: allow a future srvready
-            // to trigger a fresh connect attempt.
-            this._srvReady = false;
-            this._v4Connected = false;
-            this._connectAttempts = 0;
+          let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+          if (msg.t === 'hello') {
+            this._mySeat = msg.seat || 0;
+            // hello usually beats the 2s watchdog by seconds: bind the engine
+            // NOW if the module already exists (idempotent; safe if not).
+            this.bridge.attach();
+            if (!isHost) {
+              // Client: the engine's outgoing packets land in queue[1]; this
+              // tab runs no server, so the bridge is their only consumer.
+              // Safe even when unattached: the cursor initializes at the live
+              // edge on the first successful attach (never Atomics-on-null).
+              this.bridge.onQueue(Q_SV_IN, (bytes) => {
+                if (wsOk && ws?.readyState === 1) { try { ws.send(bytes); } catch (e) {} }
+              });
+            }
+          } else if (msg.t === 'srvready') {
+            if (!this._srvReady) this.pushKillFeed('Host server is live');
+            this._srvReady = true;
+          } else if (msg.t === 'gone') {
+            if (isHost && msg.seat) {
+              const port = seatPort(msg.seat);
+              if (this._seatDrains.has(port)) { this.bridge.offQueue(port); this._seatDrains.delete(port); }
+            } else if (!isHost && msg.isHost) {
+              // The host (and its native server) is gone: allow a future srvready
+              // to trigger a fresh connect attempt.
+              this._srvReady = false;
+              this._v4Connected = false;
+              this._connectAttempts = 0;
+            }
+            this.pushKillFeed(`${msg.n || 'Player'} left the game`);
+          } else if (msg.t === 'pong') {
+            this.wsRtt = Math.max(1, Math.round(performance.now() - (msg.ts || 0)));
           }
-          this.pushKillFeed(`${msg.n || 'Player'} left the game`);
-        } else if (msg.t === 'pong') {
-          this.wsRtt = Math.max(1, Math.round(performance.now() - (msg.ts || 0)));
-        }
+        } catch (e) { console.warn('[COOPNET] ws message error', e); }
       };
       ws.onclose = () => {
         wsOk = false;
@@ -494,7 +514,10 @@ class ModMenuManager {
     this._wsPingTimer = setInterval(() => {
       try {
         if (this._coopStopped) return;
-        if (!this.bridge.isAttached()) this.bridge.attach();
+        // attach() is idempotent and cheap; call it every tick so a grown WASM
+        // memory (fresh buffer object) is re-bound within 2s and packets that
+        // were staged before the engine existed get flushed early.
+        this.bridge.attach();
 
         if (isHost) {
           // Announce the listen server while the tab is actually in-game.

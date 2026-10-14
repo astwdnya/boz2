@@ -65,46 +65,79 @@ export class CoopNativeBridge {
     this.cursors = new Map();    // queueIndex -> our reader cursor
     this.handlers = new Map();   // queueIndex -> (bytes, port) => void
     this.relayLog = [];          // ring of {t, dir, bytes} for diagnostics
+    this.pending = [];           // packets staged before attach
   }
 
   // Attach to the running engine module. Returns false until the module and
-  // its memory exist. Safe to call repeatedly.
+  // its memory exist. Safe to call repeatedly; also re-binds the views when
+  // the WASM memory has grown (a growth swaps the buffer object under us).
   attach(module) {
     const mod = module || globalThis.__kisakModule || globalThis.__kisakEngine?.getModule();
     if (!mod) return false;
+    this.module = mod;
+    if (!this._ensureLive()) return false;
+    // Handlers registered before the engine existed start at the live edge
+    // now (never replay stale slots, never read with a null view).
+    for (const qi of this.handlers.keys()) {
+      if (this.cursors.get(qi) == null) this.cursors.set(qi, this.qSend(qi));
+    }
+    this._flushStaged();
+    return true;
+  }
+
+  // Bind (or re-bind) the memory views to the module's CURRENT buffer.
+  _ensureLive() {
+    const mod = this.module;
+    if (!mod) return false;
     const buf = mod.HEAPU8?.buffer || mod.wasmMemory?.buffer || mod.HEAPF32?.buffer || mod.buffer;
     if (!buf) return false;
+    if (this.u8 && this.u8.buffer === buf) return true; // still live
     // The loopback queue region is touched by the engine as soon as the net
     // stack initializes; a sanity probe keeps us from binding to a wrong heap.
     const probe = LOOP_BASE + Q_STRIDE * (MAX_SEATS + 2);
     if (buf.byteLength < probe + 2048) return false;
-    if (this.module === mod && this.u8) return true;
-    this.module = mod;
     this.u8 = new Uint8Array(buf);
     this.i32 = new Int32Array(buf);
     this.atomics = this.i32; // SharedArrayBuffer-backed; Atomics.* usable
     return true;
   }
 
-  isAttached() { return Boolean(this.module && this.u8); }
+  isAttached() { return Boolean(this.module && this.u8 && this.i32); }
 
   detach() {
     this.stopPolling();
     this.module = null; this.u8 = null; this.i32 = null; this.atomics = null;
     this.cursors.clear(); this.handlers.clear();
+    this.pending = [];
+  }
+
+  // Stage a packet that arrived before the engine memory was attachable.
+  // Flushed in order on the first successful attach; capped so a broken
+  // session cannot grow it without bound.
+  stage(qi, bytes, port) {
+    if (this.pending.length < 96) this.pending.push({ qi, bytes, port });
+  }
+
+  _flushStaged() {
+    if (!this.pending.length) return;
+    const list = this.pending; this.pending = [];
+    for (const p of list) this.injectSync(p.qi, p.bytes, p.port);
   }
 
   // ---- queue primitives (exact engine contract) ----
 
   qBase(qi) { return LOOP_BASE + qi * Q_STRIDE; }
-  qGet(qi) { return Atomics.load(this.i32, (this.qBase(qi) + OFF_GET) >> 2); }
-  qSend(qi) { return Atomics.load(this.i32, (this.qBase(qi) + OFF_SEND) >> 2); }
+  // These MUST NOT throw when the engine memory is not attached yet (WS events
+  // can arrive long before the watchdog attaches us — see modmenu.js). A
+  // detached bridge simply reports an empty queue.
+  qGet(qi) { return this.i32 ? Atomics.load(this.i32, (this.qBase(qi) + OFF_GET) >> 2) : 0; }
+  qSend(qi) { return this.i32 ? Atomics.load(this.i32, (this.qBase(qi) + OFF_SEND) >> 2) : 0; }
 
   // Write one packet into a queue slot exactly like the engine's enqueue
   // (Netchan_Transmit / NET_OutOfBandPrint): data, port, size, then a
   // sequentially-consistent bump of the send counter.
   async inject(qi, bytes, port) {
-    if (!this.isAttached()) return false;
+    if (!this._ensureLive()) return false;
     const n = bytes.length | 0;
     if (n <= 0 || n > SLOT_DATA) return false;
     const base = this.qBase(qi);
@@ -130,7 +163,7 @@ export class CoopNativeBridge {
 
   // Synchronous variant for callers that must not defer (frame hooks).
   injectSync(qi, bytes, port) {
-    if (!this.isAttached()) return false;
+    if (!this._ensureLive()) return false;
     const n = bytes.length | 0;
     if (n <= 0 || n > SLOT_DATA) return false;
     const base = this.qBase(qi);
@@ -152,7 +185,13 @@ export class CoopNativeBridge {
   // itself will never read (our virtual endpoints). One handler per queue.
   onQueue(qi, handler) {
     this.handlers.set(qi, handler);
-    if (!this.cursors.has(qi)) this.cursors.set(qi, this.qSend(qi)); // start at live edge
+    // Start at the live edge ONLY when the engine memory is already bound.
+    // Before attach we have no view at all — drainOnce() initializes the
+    // cursor at the live edge on the first attached drain instead. Reading a
+    // cursor here would touch Atomics on null and kill the page (bug fixed).
+    if (this.cursors.get(qi) == null && this.isAttached()) {
+      this.cursors.set(qi, this.qSend(qi));
+    }
     this.startPolling();
   }
 
@@ -164,7 +203,7 @@ export class CoopNativeBridge {
 
   // Read every new slot our cursor has not yet consumed.
   drainOnce() {
-    if (!this.isAttached()) return;
+    if (!this._ensureLive()) return;
     for (const [qi, handler] of this.handlers) {
       const base = this.qBase(qi);
       const send = Atomics.load(this.i32, (base + OFF_SEND) >> 2);
