@@ -351,6 +351,50 @@ class GameServerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ---- keep-alive framing hygiene --------------------------------------
+    # protocol_version is HTTP/1.1 (persistent connections). Every request
+    # body MUST be drained before responding, or the leftover bytes are
+    # parsed as the next request line -> "400 Bad request syntax" and a dead
+    # connection. Field evidence: Cloudflare RUM beacons (POST /cdn-cgi/rum)
+    # poisoned reused connections exactly this way in the Railway log.
+    def _drain_body(self):
+        """Read and return the request body (Content-Length based). For
+        unframeable encodings (chunked) give up on this connection instead of
+        corrupting the next keep-alive request."""
+        te = (self.headers.get('Transfer-Encoding') or '').lower()
+        if 'chunked' in te:
+            self.close_connection = True
+            return ''
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0:
+            return ''
+        if n > 10 * 1024 * 1024:  # absurd for this app: drop, don't read
+            self.close_connection = True
+            return ''
+        try:
+            return self.rfile.read(n).decode('utf-8', errors='ignore')
+        except Exception:
+            self.close_connection = True
+            return ''
+
+    def log_message(self, fmt, *args):
+        # Access logs belong on stdout: Railway tags stderr lines as [err],
+        # which made every request look like a failure in the deploy log.
+        # stderr stays reserved for real problems (log_error still uses it).
+        try:
+            msg = fmt % args
+        except Exception:
+            msg = repr((fmt, args))
+        try:
+            sys.stdout.write('%s - - [%s] %s\n' %
+                             (self.address_string(), self.log_date_time_string(), msg))
+            sys.stdout.flush()
+        except Exception:
+            pass
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_cors_and_security_headers()
@@ -362,10 +406,12 @@ class GameServerHandler(BaseHTTPRequestHandler):
         if path.startswith('/bo1z/'):
             path = path[len('/bo1z'):]
 
+        # Drain the body FIRST for every path (keep-alive hygiene; see
+        # _drain_body). API branches below reuse the drained body.
+        post_body = self._drain_body()
+
         # API: Multiplayer Online Room endpoints
         if path.startswith('/api/rooms'):
-            content_length = int(self.headers.get('Content-Length', 0))
-            post_body = self.rfile.read(content_length).decode('utf-8', errors='ignore') if content_length > 0 else '{}'
             try:
                 data = json.loads(post_body) if post_body.strip() else {}
             except Exception:
@@ -598,6 +644,9 @@ class GameServerHandler(BaseHTTPRequestHandler):
         self.handle_request(send_body=True)
 
     def handle_request(self, send_body=True):
+        # GET/HEAD with a body is unusual, but beacons do it; drain so the
+        # keep-alive framing stays intact (the body content is ignored here).
+        self._drain_body()
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
