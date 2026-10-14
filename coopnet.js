@@ -22,7 +22,8 @@
 //   - client-socket sends (sock==0, both Netchan and OOB) are always
 //     enqueued into queue[1] with slot port = 0
 //   - server-socket sends (sock==1) are enqueued into queue[dst.port & 0xffff]
-//     (NET_StringToAdr: "loopback" -> NA_LOOPBACK, port parsed after ':')
+//     (NET_StringToAdr resolves ONLY "localhost" -> NA_LOOPBACK; "loopback"
+//     is NOT resolvable and makes CL_Connect_f Com_Error 'Bad server address')
 //
 // This bridge moves those native packets between two browser tabs over the
 // room's WebSocket hub (server.py), so the REAL T5 co-op protocol runs:
@@ -34,7 +35,9 @@
 //   CL reads   <- queue[0] <--WS--     queue[SEAT] drained by bridge
 //
 // The client boots without +devmap (native main menu) and runs
-// `connect loopback` once the host reports its server is ready.
+// `connect localhost` once the host reports its server is ready.
+// (v4.2 fix: `connect loopback` was rejected by NET_StringToAdr ->
+//  Com_ERROR "Bad server address" killed the member engine.)
 // ------------------------------------------------------------
 
 const LOOP_BASE = 135783616;   // &queue[0]

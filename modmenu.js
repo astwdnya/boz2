@@ -416,7 +416,7 @@ class ModMenuManager {
       if (this._connectAttempts >= 5) return;
       this._lastConnectAt = now;
       this._connectAttempts++;
-      this.cmd('connect loopback');
+      this.cmd('connect localhost');
       this.pushKillFeed(`Connecting to host's co-op server (try ${this._connectAttempts})...`);
     };
 

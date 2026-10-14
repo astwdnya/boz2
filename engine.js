@@ -410,7 +410,7 @@ export function createEngine(canvas, state) {
     //  - host: same devmap boot, but the native server must accept the room's
     //    remote clients (client capacity dvars before the map spawns).
     //  - client: NO devmap at all - the engine boots to the native main menu
-    //    and coopnet.js runs `connect loopback` once the host's server is up;
+    //    and coopnet.js runs `connect localhost` once the host's server is up;
     //    the map/gamestate then arrive over the native snapshot protocol.
     const coopQuery = new URLSearchParams(location.search).get('coop');
     const coopSessionJoin = (() => { try {
