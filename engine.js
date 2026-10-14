@@ -406,6 +406,27 @@ export function createEngine(canvas, state) {
     }, 8);
     // Dvars precede devmap so startup receives the player's saved settings.
     const args = [...fiveArguments];
+    // coop4: an online-party tab boots differently from solo:
+    //  - host: same devmap boot, but the native server must accept the room's
+    //    remote clients (client capacity dvars before the map spawns).
+    //  - client: NO devmap at all - the engine boots to the native main menu
+    //    and coopnet.js runs `connect loopback` once the host's server is up;
+    //    the map/gamestate then arrive over the native snapshot protocol.
+    const coopQuery = new URLSearchParams(location.search).get('coop');
+    const coopSessionJoin = (() => { try {
+      const v = sessionStorage.getItem('bo1z-coop-join');
+      if (v) sessionStorage.removeItem('bo1z-coop-join'); // consume-once: never leaks into later solo boots
+      return v;
+    } catch (e) { return null; } })();
+    const coopJoin = coopQuery === 'join' || coopSessionJoin === '1';
+    let coopHost = false;
+    try { coopHost = JSON.parse(sessionStorage.getItem('bo1z-online-party') || 'null')?.isHost === true; } catch (e) {}
+    if (coopHost) {
+      args.splice(args.indexOf('+devmap'), 0,
+        '+set', 'sv_maxclients', '4',
+        '+set', 'com_maxclients', '4',
+        '+set', 'party_maxplayers', '4');
+    }
     // Renderer: pipelined WebGPU by default when the adapter has every required
     // feature; WebGL2 otherwise. ?renderer=webgl2|webgpu overrides. The engine
     // still falls back to WebGL2 when the pack lacks shaders-wgsl.pack.
@@ -480,8 +501,28 @@ export function createEngine(canvas, state) {
         gate.module = module; state.packGateExpected = gate.paths.length - gate.ready.size;
       } else await gate.bootReady;
     }
+    // coop4: a join client boots to the native main menu - no local map/server.
+    if (coopJoin) { const di = args.indexOf('+devmap'); if (di >= 0) args.splice(di, 2); }
     state.timings.callMain = performance.now();
     module.callMain(args);
+    if (coopJoin) {
+      // A join client never prints "KISAK_BROWSER map-loaded" (no local map),
+      // so the normal warmGate 'ready' would never fire. Drive readiness from
+      // the native main menu appearing instead, with a bounded fallback.
+      const joinReady = setInterval(() => {
+        if (stopped || state.readyFired) { clearInterval(joinReady); return; }
+        const heldMs = performance.now() - state.timings.callMain;
+        let menuUp = false;
+        try { menuUp = Boolean(module?._KB_UIState && module._KB_UIState() !== 0); } catch (e) {}
+        if ((menuUp && heldMs > 3000) || heldMs > 15000) {
+          clearInterval(joinReady);
+          state.readyFired = true; state.readyFiredReason = 'coop-join-menu';
+          progress('ready', 1, 'Co-op join: waiting for the host');
+        } else {
+          progress('files', null, 'Booting engine (co-op join)...');
+        }
+      }, 500);
+    }
     // Transfer loses pointer-lock state queued before module initialization.
     module._KB_Input(3, Number(document.pointerLockElement === canvas), 0);
   }

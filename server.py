@@ -34,7 +34,7 @@ WS_MAX_FRAME = 1 << 20   # 1 MiB guard
 
 
 class WsClient:
-    __slots__ = ('conn', 'room', 'pid', 'name', 'is_host', 'send_lock')
+    __slots__ = ('conn', 'room', 'pid', 'name', 'is_host', 'seat', 'send_lock')
 
     def __init__(self, conn):
         self.conn = conn
@@ -42,12 +42,21 @@ class WsClient:
         self.pid = None
         self.name = ''
         self.is_host = False
+        self.seat = 0            # 0 = host, 1..3 = clients (loopback seats)
         self.send_lock = threading.Lock()
 
     def send_text(self, text):
         try:
             with self.send_lock:
                 ws_send_frame(self.conn, text.encode('utf-8'), opcode=1)
+            return True
+        except Exception:
+            return False
+
+    def send_binary(self, data):
+        try:
+            with self.send_lock:
+                ws_send_frame(self.conn, bytes(data), opcode=2)
             return True
         except Exception:
             return False
@@ -111,6 +120,12 @@ def ws_send_frame(conn, payload, opcode=1):
     conn.sendall(bytes(hdr) + payload)
 
 
+def ws_roommates(room_id, exclude=None):
+    """Snapshot of the other clients in a room (under the lock)."""
+    with WS_LOCK:
+        return [c for c in list(WS_CLIENTS.get(room_id, [])) if c is not exclude]
+
+
 def ws_broadcast(room_id, data, exclude=None):
     with WS_LOCK:
         clients = list(WS_CLIENTS.get(room_id, []))
@@ -144,6 +159,25 @@ def ws_client_thread(conn, addr):
                 continue
             if opcode == 10:         # pong
                 continue
+            if opcode == 2:          # Co-op v4: native loopback packet relay
+                if not client.room or not client.pid:
+                    continue
+                if client.is_host:
+                    # Host -> client: payload = [seat byte][raw packet]
+                    if not payload:
+                        continue
+                    dest_seat = payload[0]
+                    for c in ws_roommates(client.room, exclude=client):
+                        if not c.is_host and c.seat == dest_seat:
+                            c.send_binary(payload[1:])
+                            break
+                else:
+                    # Client -> host: raw packet, tagged with the sender seat
+                    for c in ws_roommates(client.room, exclude=client):
+                        if c.is_host:
+                            c.send_binary(bytes([client.seat & 0xff]) + payload)
+                            break
+                continue
             if opcode != 1:          # only text frames carry JSON
                 continue
             try:
@@ -158,10 +192,26 @@ def ws_client_thread(conn, addr):
                 client.name = str(msg.get('name') or 'Player')[:24]
                 client.is_host = bool(msg.get('isHost'))
                 with WS_LOCK:
-                    WS_CLIENTS.setdefault(room, []).append(client)
-                client.send_text(json.dumps({'t': 'hello', 'pid': client.pid}))
+                    lst = WS_CLIENTS.setdefault(room, [])
+                    # Hosts keep seat 0; clients claim the next free seat 1..255.
+                    if client.is_host:
+                        client.seat = 0
+                    else:
+                        taken = {c.seat for c in lst}
+                        seat = 1
+                        while seat in taken and seat < 256:
+                            seat += 1
+                        client.seat = seat
+                    lst.append(client)
+                client.send_text(json.dumps({'t': 'hello', 'pid': client.pid,
+                                             'seat': client.seat}))
             elif mtype == 'ping':
                 client.send_text(json.dumps({'t': 'pong', 'ts': msg.get('ts', 0)}))
+            elif mtype == 'srvready' and client.room and client.is_host:
+                # Host announces its native server is running; clients may connect.
+                out = json.dumps({'t': 'srvready', 'p': client.pid},
+                                 separators=(',', ':'))
+                ws_broadcast(client.room, out, exclude=client)
             elif mtype == 's' and client.room:
                 out = json.dumps({'t': 's', 'p': client.pid, 's': msg.get('s', {})},
                                  separators=(',', ':'))
@@ -177,7 +227,9 @@ def ws_client_thread(conn, addr):
                     lst.remove(client)
                 if lst is not None and room in WS_CLIENTS and not WS_CLIENTS[room]:
                     WS_CLIENTS.pop(room, None)
-            ws_broadcast(room, json.dumps({'t': 'gone', 'p': pid, 'n': name}))
+            ws_broadcast(room, json.dumps({'t': 'gone', 'p': pid, 'n': name,
+                                           'seat': client.seat,
+                                           'isHost': client.is_host}))
         try:
             conn.close()
         except Exception:

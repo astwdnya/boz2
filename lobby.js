@@ -609,6 +609,14 @@ class LobbyManager {
             isHost: this.isHost
           }));
 
+          // coop4: clients boot to the native main menu and connect to the
+          // host's live server over the relay (no local devmap). engine.js
+          // consumes this flag once at boot.
+          try {
+            if (this.isHost) sessionStorage.removeItem('bo1z-coop-join');
+            else sessionStorage.setItem('bo1z-coop-join', '1');
+          } catch (e) {}
+
           // Trigger map pick for all players using the room's mapId!
           const targetMapId = room.mapId || (this.currentMap && this.currentMap.id) || 'nacht';
           console.log(`[LOBBY] Launching synchronized co-op game for map: ${targetMapId}`);

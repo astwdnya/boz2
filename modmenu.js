@@ -3,6 +3,7 @@
 // ========================================================
 
 import { CoopSoldier3D, projectToGameRect } from './coop3d.js';
+import { CoopNativeBridge, Q_SV_IN, Q_CL_IN, seatPort } from './coopnet.js';
 
 const WEAPONS_DB = [
   // --- Wonder Weapons ---
@@ -304,7 +305,7 @@ class ModMenuManager {
         e.preventDefault();
         e.stopImmediatePropagation();
         this.toggle();
-      } else if (e.code === 'Tab') {
+      } else if (e.code === 'Tab' && !this._v4Native) {
         this.showScoreboard();
       }
     }, true);
@@ -332,9 +333,8 @@ class ModMenuManager {
     this.roomId = partyData.room.id;
     this._spawnDeadline = performance.now() + 25000;
 
-    // Ensure the shared render loop (ESP canvas + 3D soldiers) is active
-    if (!this.espAnimFrame) this.startESPOverlay();
-
+    // coop4: the engine itself renders teammates, zombies and rounds through
+    // its native netcode; no ESP/soldier overlay is auto-started.
     this.coopStartNetwork();
   }
 
@@ -371,41 +371,111 @@ class ModMenuManager {
     return st;
   }
 
-  // ---- Transport: WebSocket hub (server.py) with HTTP polling fallback ----
+  // ---- Co-op v4: native engine netcode bridge (server.py WS relay) ----
+  // The engine runs the REAL T5 client/server protocol over its in-memory
+  // loopback queues (see coopnet.js). This hub moves those packets between
+  // tabs: client queue[1] -> host queue[1] (seat-ported), host queue[SEAT]
+  // -> client queue[0]. The engine does everything else.
   coopStartNetwork() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const pathBase = location.pathname.replace(/[^/]*$/, '');
     const wsUrl = `${proto}://${location.host}${pathBase}ws`;
+    const isHost = Boolean(this.partyData?.isHost);
+    this._v4Native = true;
+    this._v4Connected = false;
+    this._srvReady = false;
+    this._connectAttempts = 0;
+    this._lastConnectAt = 0;
+    this._seatDrains = new Set();     // host: relayed loopback ports
+    this.bridge = new CoopNativeBridge();
 
-    let ws = null, wsOk = false, reconnectDelay = 1000, tick = 0;
+    let ws = null, wsOk = false, reconnectDelay = 1000;
+
+    const ensureHostDrain = (seat) => {
+      const port = seatPort(seat);
+      if (this._seatDrains.has(port)) return;
+      this._seatDrains.add(port);
+      this.bridge.onQueue(port, (bytes) => {
+        if (wsOk && ws?.readyState === 1) {
+          const frame = new Uint8Array(bytes.length + 1);
+          frame[0] = seat & 0xff; frame.set(bytes, 1);
+          try { ws.send(frame); } catch (e) {}
+        }
+      });
+    };
+
+    const tryConnect = () => {
+      // The client engine executes the real connect command; its CL then
+      // performs the T5 handshake against the host's server via the relay.
+      if (this._v4Connected || !wsOk) return;
+      const now = performance.now();
+      if (now - this._lastConnectAt < 12000) return;
+      if (this._connectAttempts >= 5) return;
+      this._lastConnectAt = now;
+      this._connectAttempts++;
+      this.cmd('connect loopback');
+      this.pushKillFeed(`Connecting to host's co-op server (try ${this._connectAttempts})...`);
+    };
 
     const connect = () => {
       if (this._coopStopped) return;
-      try { ws = new WebSocket(wsUrl); } catch (e) { this.coopStartHttpFallback(); return; }
+      try { ws = new WebSocket(wsUrl); } catch (e) { return; }
+      ws.binaryType = 'arraybuffer';
       ws.onopen = () => {
         wsOk = true; reconnectDelay = 1000;
         try {
           ws.send(JSON.stringify({ t: 'join', room: this.roomId, pid: this.myPid,
-            name: this.myName, isHost: Boolean(this.partyData?.isHost) }));
-          this.pushKillFeed('🌐 Live co-op sync connected');
+            name: this.myName, isHost: isHost }));
+          this.pushKillFeed('Co-op v4: native relay connected');
         } catch (e) {}
       };
       ws.onmessage = (ev) => {
+        // Binary frame = one native loopback packet from the peer side.
+        if (ev.data instanceof ArrayBuffer) {
+          const pkt = new Uint8Array(ev.data);
+          try {
+            if (isHost) {
+              if (!pkt.length) return;
+              const seat = pkt[0];
+              ensureHostDrain(seat);
+              this.bridge.injectSync(Q_SV_IN, pkt.subarray(1), seatPort(seat));
+            } else {
+              this.bridge.injectSync(Q_CL_IN, pkt, 0);
+            }
+          } catch (e) { console.warn('[COOPNET] relay error', e); }
+          return;
+        }
         let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
-        if (msg.t === 's' && msg.s) {
-          msg.s.playerId = msg.p;
-          this.coopApplyPeer(msg.s);
+        if (msg.t === 'hello') {
+          this._mySeat = msg.seat || 0;
+          if (!isHost) {
+            // Client: the engine's outgoing packets land in queue[1]; this tab
+            // runs no server, so the bridge is their only consumer.
+            this.bridge.onQueue(Q_SV_IN, (bytes) => {
+              if (wsOk && ws?.readyState === 1) { try { ws.send(bytes); } catch (e) {} }
+            });
+          }
+        } else if (msg.t === 'srvready') {
+          if (!this._srvReady) this.pushKillFeed('Host server is live');
+          this._srvReady = true;
         } else if (msg.t === 'gone') {
-          this.coopPlayers = this.coopPlayers.filter(p => p.playerId !== msg.p);
-          this._peerZb.delete(msg.p);
-          this.pushKillFeed(`👋 ${msg.n || 'Player'} left the game`);
+          if (isHost && msg.seat) {
+            const port = seatPort(msg.seat);
+            if (this._seatDrains.has(port)) { this.bridge.offQueue(port); this._seatDrains.delete(port); }
+          } else if (!isHost && msg.isHost) {
+            // The host (and its native server) is gone: allow a future srvready
+            // to trigger a fresh connect attempt.
+            this._srvReady = false;
+            this._v4Connected = false;
+            this._connectAttempts = 0;
+          }
+          this.pushKillFeed(`${msg.n || 'Player'} left the game`);
         } else if (msg.t === 'pong') {
           this.wsRtt = Math.max(1, Math.round(performance.now() - (msg.ts || 0)));
         }
       };
       ws.onclose = () => {
         wsOk = false;
-        this.coopStartHttpFallback();
         setTimeout(connect, reconnectDelay);
         reconnectDelay = Math.min(8000, reconnectDelay * 2);
       };
@@ -414,42 +484,39 @@ class ModMenuManager {
     };
     connect();
 
-    // App-level ping for the scoreboard RTT readout.
-    setInterval(() => {
-      if (wsOk && this.coopWs?.readyState === 1) {
-        try { this.coopWs.send(JSON.stringify({ t: 'ping', ts: performance.now() })); } catch (e) {}
-      }
-    }, 2000);
+    window.addEventListener('beforeunload', () => {
+      this._coopStopped = true;
+      try { this.coopWs?.close(); } catch (e) {}
+      this.bridge?.detach();
+    });
 
-    // 30 Hz state push; zombie snapshot piggybacks at ~7.5 Hz.
-    this.coopSyncTimer = setInterval(() => {
-      tick++;
+    // Watchdog: engine attach, host server heartbeat, client connect attempts.
+    this._wsPingTimer = setInterval(() => {
       try {
-        if (document.body?.dataset?.screen !== 'playing') return;
-        const st = this.coopBuildState(tick % 4 === 0);
-        // movement detection from sent-position deltas (30 Hz)
-        if (this._lastSentX !== undefined) {
-          const sp = Math.hypot(st.x - this._lastSentX, st.y - this._lastSentY, st.z - this._lastSentZ) / 0.033;
-          this._moving = sp > 25;
-        }
-        this._lastSentX = st.x; this._lastSentY = st.y; this._lastSentZ = st.z;
-        st.mv = Boolean(this._moving);
+        if (this._coopStopped) return;
+        if (!this.bridge.isAttached()) this.bridge.attach();
 
+        if (isHost) {
+          // Announce the listen server while the tab is actually in-game.
+          if (document.body?.dataset?.screen === 'playing'
+              && wsOk && this.coopWs?.readyState === 1) {
+            this.coopWs.send(JSON.stringify({ t: 'srvready' }));
+          }
+        } else if (document.body?.dataset?.screen === 'playing') {
+          if (this._srvReady) tryConnect();
+          // In-game detection: the CG context exists only once the joined map
+          // is rendering. Flip to connected and stop retrying.
+          const mem = this.getMemoryContext();
+          if (mem?.cgPtr && !this._v4Connected) {
+            this._v4Connected = true;
+            this.pushKillFeed('Co-op joined: native engine sync active');
+          }
+        }
         if (wsOk && this.coopWs?.readyState === 1) {
-          this.coopWs.send(JSON.stringify({ t: 's', s: st }));
-        } else {
-          this._coopHttpPayload = st;
-        }
-
-        // Spawn alignment retries during the first 25 s (host state may arrive late).
-        if (!this.partyData?.isHost && !this._spawnAligned && performance.now() < this._spawnDeadline) {
-          const host = this.coopPlayers.find(p => p.isHost);
-          if (host) this.alignInitialSpawn(host);
+          try { this.coopWs.send(JSON.stringify({ t: 'ping', ts: performance.now() })); } catch (e) {}
         }
       } catch (e) {}
-    }, 33);
-
-    window.addEventListener('beforeunload', () => { this._coopStopped = true; try { this.coopWs?.close(); } catch (e) {} });
+    }, 2000);
   }
 
   coopStartHttpFallback() {
